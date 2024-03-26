@@ -23,7 +23,6 @@ defmodule Streamlog.IndexLive do
   def mount(_params, _session, socket) do
     if connected?(socket) do
       Streamlog.Worker.run()
-      Streamlog.Worker.subscribe()
     end
 
     lines =
@@ -34,7 +33,8 @@ defmodule Streamlog.IndexLive do
 
     {:ok,
      socket
-     |> stream(:logs, lines)}
+     |> stream(:logs, lines)
+     |> assign(:form, to_form(%{"query" => nil}))}
   end
 
   def handle_info({:line, line}, socket) do
@@ -61,9 +61,24 @@ defmodule Streamlog.IndexLive do
     """
   end
 
+  attr :field, Phoenix.HTML.FormField
+  attr :rest, :global, include: ~w(type)
+  def input(assigns) do
+    ~H"""
+    <input id={@field.id} name={@field.name} value={@field.value} {@rest} />
+    """
+  end
+
+  def handle_event("filter", %{"query" => query} = params, socket) do
+    {:noreply, assign(socket, form: to_form(params))}
+  end
+
   def render(assigns) do
     ~H"""
     <h1>Logs</h1>
+    <.form for={@form} phx-change="filter" >
+      <.input type="text" field={@form[:query]} />
+    </.form>
     <table>
       <thead>
         <tr>
@@ -114,6 +129,7 @@ defmodule Streamlog.Worker do
 
   def run() do
     GenServer.cast(__MODULE__, :run)
+    Phoenix.PubSub.subscribe(:lines, @topic)
   end
 
   @impl true
@@ -135,10 +151,6 @@ defmodule Streamlog.Worker do
 
   defp notify_subscribers(line) do
     Phoenix.PubSub.broadcast(:lines, @topic, {:line, line})
-  end
-
-  def subscribe do
-    Phoenix.PubSub.subscribe(:lines, @topic)
   end
 end
 
