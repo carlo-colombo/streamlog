@@ -73,14 +73,28 @@ defmodule Streamlog.IndexLive do
     ~H"""
     <script src="https://cdn.jsdelivr.net/npm/phoenix@1.7.11/priv/static/phoenix.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/phoenix_live_view@0.20.12/priv/static/phoenix_live_view.min.js"></script>
-    <link rel="stylesheet" href="https://unpkg.com/mvp.css">
     <script>
       let liveSocket = new window.LiveView.LiveSocket("/live", window.Phoenix.Socket)
       liveSocket.connect()
     </script>
     <style>
-      table td {
+      :root {
+        --color-accent: #118bee15;
+      }
+      table {
         text-align: left;
+        font-family: monospace;
+        display: table;
+        max-width: 100%;
+
+        td {
+          padding-right: 10px;
+          border-right: solid 1px #339981;
+        }
+
+        tr:nth-child(even) {
+          background-color: var(--color-accent);
+        }
       }
     </style>
     <%= @inner_content %>
@@ -98,24 +112,24 @@ defmodule Streamlog.IndexLive do
 
   def render(assigns) do
     ~H"""
-    <h1>Logs</h1>
     <.form for={@form} phx-change="filter" >
-      <.input type="text" field={@form[:query]} />
+      <table>
+        <thead>
+          <tr>
+            <th>timestamp</th>
+            <th>
+              <.input type="text" field={@form[:query]} placeholder="filter using regex"/>
+            </th>
+          </tr>
+        </thead>
+        <tbody id="log-list" phx-update="stream">
+          <tr :for={{id, log} <- @streams.logs} id={id} >
+            <td><%= log.timestamp %></td>
+            <td><%= log.line %></td>
+          </tr>
+        </tbody>
+      </table>
     </.form>
-    <table>
-      <thead>
-        <tr>
-          <th>timestamp</th>
-          <th>-</th>
-        </tr>
-      </thead>
-      <tbody id="log-list" phx-update="stream">
-        <tr :for={{id, log} <- @streams.logs} id={id} >
-          <td><%= log.timestamp %></td>
-          <td><%= log.line %></td>
-        </tr>
-      </tbody>
-    </table>
     """
   end
 end
@@ -206,7 +220,7 @@ defmodule Streamlog.State do
     if query == nil do
       {nil, nil}
     else
-      case Regex.compile(query) do
+      case Regex.compile(query, [:caseless]) do
         {:ok, regex} -> {query, regex}
         _ -> {query, nil}
       end
