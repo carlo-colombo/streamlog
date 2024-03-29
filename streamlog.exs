@@ -1,21 +1,7 @@
-Application.put_env(:streamlog, Streamlog.Endpoint,
-  http: [ip: {127, 0, 0, 1}, port: 5001],
-  server: true,
-  live_view: [signing_salt: "aaaaaaaa"],
-  secret_key_base: String.duplicate("a", 64)
-)
-
+#!/usr/bin/env elixir
 Mix.install([
-  {:plug_cowboy, "~> 2.5"},
-  {:jason, "~> 1.0"},
-  {:phoenix, "~> 1.7.11", override: true},
-  {:phoenix_live_view, "~> 0.20.12"},
-  {:phoenix_live_dashboard, "~> 0.8.3"}
+  {:phoenix_now, github: "carlo-colombo/phoenix_now"}
 ])
-
-defmodule Streamlog.ErrorView do
-  def render(template, _), do: Phoenix.Controller.status_message_from_template(template)
-end
 
 defmodule Streamlog.IndexLive do
   use Phoenix.LiveView, layout: {__MODULE__, :live}
@@ -25,7 +11,7 @@ defmodule Streamlog.IndexLive do
       Streamlog.Worker.run()
     end
 
-    {query, regex} = Streamlog.State.get_query_and_regex()
+    {query, regex} = get_query_and_regex()
 
     {:ok,
      socket
@@ -34,7 +20,7 @@ defmodule Streamlog.IndexLive do
   end
 
   def handle_info({:line, line}, socket) do
-    {_, regex} = Streamlog.State.get_query_and_regex()
+    {_, regex} = get_query_and_regex()
 
     {:noreply,
      if regex == nil or String.match?(line.line, regex) do
@@ -47,12 +33,25 @@ defmodule Streamlog.IndexLive do
   def handle_event("filter", %{"query" => query} = params, socket) do
     Streamlog.State.set(&%{&1 | "query" => query})
 
-    {_, regex} = Streamlog.State.get_query_and_regex()
+    {_, regex} = get_query_and_regex()
 
     {:noreply,
      socket
      |> stream(:logs, filtered_lines(regex), reset: true)
      |> assign(:form, to_form(params))}
+  end
+
+  defp get_query_and_regex do
+    query = Streamlog.State.get("query")
+
+    if query == nil do
+      {nil, nil}
+    else
+      case Regex.compile(query, [:caseless]) do
+        {:ok, regex} -> {query, regex}
+        _ -> {query, nil}
+      end
+    end
   end
 
   defp filtered_lines(regex) do
@@ -69,38 +68,6 @@ defmodule Streamlog.IndexLive do
     |> Enum.sort(:desc)
   end
 
-  def render("live.html", assigns) do
-    ~H"""
-    <script src="https://cdn.jsdelivr.net/npm/phoenix@1.7.11/priv/static/phoenix.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/phoenix_live_view@0.20.12/priv/static/phoenix_live_view.min.js"></script>
-    <script>
-      let liveSocket = new window.LiveView.LiveSocket("/live", window.Phoenix.Socket)
-      liveSocket.connect()
-    </script>
-    <style>
-      :root {
-        --color-accent: #118bee15;
-      }
-      table {
-        text-align: left;
-        font-family: monospace;
-        display: table;
-        max-width: 100%;
-
-        td {
-          padding-right: 10px;
-          border-right: solid 1px #339981;
-        }
-
-        tr:nth-child(even) {
-          background-color: var(--color-accent);
-        }
-      }
-    </style>
-    <%= @inner_content %>
-    """
-  end
-
   attr(:field, Phoenix.HTML.FormField)
   attr(:rest, :global, include: ~w(type))
 
@@ -112,6 +79,26 @@ defmodule Streamlog.IndexLive do
 
   def render(assigns) do
     ~H"""
+     <style>
+      :root {
+        --color-accent: #118bee15;
+      }
+      table {
+        text-align: left;
+        font-family: monospace;
+        display: table;
+        mi  n-width: 100%;
+
+        td {
+          padding-right: 10px;
+          border-right: solid 1px #339981;
+        }
+
+        tr:nth-child(even) {
+          background-color: var(--color-accent);
+        }
+      }
+    </style>
     <.form for={@form} phx-change="filter" >
       <table>
         <thead>
@@ -134,23 +121,6 @@ defmodule Streamlog.IndexLive do
   end
 end
 
-defmodule Streamlog.Router do
-  use Phoenix.Router
-  import Phoenix.LiveView.Router
-  import Phoenix.LiveDashboard.Router
-
-  pipeline :browser do
-    plug(:accepts, ["html"])
-  end
-
-  scope "/", Streamlog do
-    pipe_through(:browser)
-
-    live("/", IndexLive, :index)
-    live_dashboard("/dashboard")
-  end
-end
-
 defmodule Streamlog.Worker do
   use GenServer
   @topic inspect(__MODULE__)
@@ -160,9 +130,7 @@ defmodule Streamlog.Worker do
     GenServer.start_link(__MODULE__, [], name: __MODULE__)
   end
 
-  def init([]) do
-    {:ok, false}
-  end
+  def init([]), do: {:ok, false}
 
   def run() do
     GenServer.cast(__MODULE__, :run)
@@ -191,12 +159,6 @@ defmodule Streamlog.Worker do
   end
 end
 
-defmodule Streamlog.Endpoint do
-  use Phoenix.Endpoint, otp_app: :streamlog
-  socket("/live", Phoenix.LiveView.Socket)
-  plug(Streamlog.Router)
-end
-
 defmodule Streamlog.State do
   use Agent
 
@@ -204,39 +166,21 @@ defmodule Streamlog.State do
     Agent.start_link(fn -> initial_state end, name: __MODULE__)
   end
 
-  def value do
-    Agent.get(__MODULE__, & &1)
-  end
-
-  def set(update_fn) do
-    Agent.update(__MODULE__, &update_fn.(&1))
-  end
-
+  def value, do: Agent.get(__MODULE__, & &1)
+  def set(update_fn), do: Agent.update(__MODULE__, &update_fn.(&1))
   def get(key), do: Agent.get(__MODULE__, &Map.get(&1, key))
-
-  def get_query_and_regex do
-    query = get("query")
-
-    if query == nil do
-      {nil, nil}
-    else
-      case Regex.compile(query, [:caseless]) do
-        {:ok, regex} -> {query, regex}
-        _ -> {query, nil}
-      end
-    end
-  end
 end
 
 {:ok, _} =
   Supervisor.start_link(
     [
-      Streamlog.Endpoint,
       Streamlog.Worker,
+      {Streamlog.State, %{"query" => nil}},
       {Phoenix.PubSub, name: :lines},
-      {Streamlog.State, %{"query" => nil}}
+      {PhoenixNow, live: Streamlog.IndexLive}
     ],
-    strategy: :one_for_one
+    strategy: :one_for_one,
+    name: Streamlog.Supervisor
   )
 
 unless IEx.started?() do
