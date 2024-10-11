@@ -30,7 +30,7 @@ defmodule Streamlog.IndexLive do
 
     {:noreply,
      if regex == nil or String.match?(line.line, regex) do
-       stream_insert(socket, :logs, line, at: 0)
+       stream_insert(socket, :logs, decorate_line(line, regex), at: 0)
      else
        socket
      end}
@@ -47,15 +47,20 @@ defmodule Streamlog.IndexLive do
      |> assign(:form, to_form(params))}
   end
 
+  defp decorate_line(log, nil), do: log
+  defp decorate_line(log, regex), do: %{log | :line_decorated => Regex.replace(regex, log.line, "<em>\\1</em>")}
+
   defp filtered_lines(regex) do
     :ets.tab2list(:logs)
     |> Enum.map(&elem(&1, 1))
     |> then(fn lines ->
-      if regex == nil do
+      if regex == nil or regex == "" do
         lines
       else
         lines
-        |> Enum.filter(&String.match?(&1.line, regex))
+        |> Stream.filter(&String.match?(&1.line, regex))
+        |> Stream.map(&decorate_line(&1, regex))
+        |> Enum.to_list
       end
     end)
     |> Enum.sort(:desc)
@@ -86,7 +91,7 @@ defmodule Streamlog.IndexLive do
       <tbody id="log-list" phx-update="stream">
         <tr :for={{id, log} <- @streams.logs} id={id} class={if rem(log.id,2)==0, do: "even", else: "odd"}  >
           <td class="timestamp"><%= log.timestamp %></td>
-          <td class="message"><%= log.line %></td>
+          <td class="message"><%= {:safe, log.line_decorated} %></td>
         </tr>
       </tbody>
     </table>
@@ -106,6 +111,9 @@ defmodule Streamlog.IndexLive do
 
           &.message {
             text-align: left;
+            em {
+              background-color: lightyellow;
+            }
           }
         }
         tr.odd {
@@ -162,7 +170,7 @@ defmodule Streamlog.Worker do
     |> IO.stream(:line)
     |> Stream.with_index(1)
     |> Stream.map(fn {line, index} ->
-      %{id: index, line: line, timestamp: DateTime.now!("Etc/UTC")}
+      %{id: index, line: line, timestamp: DateTime.now!("Etc/UTC"), line_decorated: line}
     end)
     |> Stream.each(&:ets.insert(:logs, {&1.id, &1}))
     |> Stream.each(&notify_subscribers(&1))
@@ -192,10 +200,10 @@ defmodule Streamlog.State do
   def get_query_and_regex do
     query = get("query")
 
-    if query == nil do
+    if query == nil or query == "" do
       {nil, nil}
     else
-      case Regex.compile(query, [:caseless]) do
+      case Regex.compile("(#{query})", [:caseless]) do
         {:ok, regex} -> {query, regex}
         _ -> {query, nil}
       end
