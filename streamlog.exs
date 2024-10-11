@@ -19,7 +19,7 @@ defmodule Streamlog.IndexLive do
       |> assign(:form, to_form(%{"query" => query}))
       |> assign(
         :page_title,
-        Application.get_env(:streamlog, Streamlog.Endpoint) |> Keyword.get(:title)
+        Application.get_env(:streamlog, :title)
       )
 
     {:ok, response}
@@ -185,14 +185,8 @@ defmodule Streamlog.State do
     Agent.start_link(fn -> initial_state end, name: __MODULE__)
   end
 
-  def value do
-    Agent.get(__MODULE__, & &1)
-  end
-
-  def set(update_fn) do
-    Agent.update(__MODULE__, &update_fn.(&1))
-  end
-
+  def value, do: Agent.get(__MODULE__, & &1)
+  def set(update_fn), do: Agent.update(__MODULE__, &update_fn.(&1))
   def get(key), do: Agent.get(__MODULE__, &Map.get(&1, key))
 
   def get_query_and_regex do
@@ -209,19 +203,30 @@ defmodule Streamlog.State do
   end
 end
 
-{options, _, _} = OptionParser.parse(System.argv(), strict: [title: :string, port: :integer])
+{options, _, _} =
+  OptionParser.parse(System.argv(),
+    strict: [
+      title: :string,
+      port: :integer
+    ]
+  )
 
-Application.put_env(:streamlog, Streamlog.Endpoint,
-  title: Keyword.get(options, :title, "Stream Log")
-)
+options =
+  Keyword.validate!(options,
+    title: "Stream Log",
+    port: 5051
+  )
+
+Application.put_env(:streamlog, :title, Keyword.fetch!(options, :title))
 
 {:ok, _} =
   PhoenixPlayground.start(
     plug: Streamlog.Router,
+    live_reload: false,
     child_specs: [
       Streamlog.Worker,
       {Streamlog.State, %{"query" => nil}}
     ],
     open_browser: false,
-    port: Keyword.get(options, :port, 5001)
+    port: Keyword.fetch!(options, :port)
   )
