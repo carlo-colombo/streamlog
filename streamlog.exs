@@ -53,8 +53,15 @@ defmodule Streamlog.IndexLive do
 
   defp decorate_line(log, nil), do: log
 
-  defp decorate_line(log, regex),
-    do: %{log | :line_decorated => Regex.replace(regex, log.line, "<em>\\1</em>")}
+  defp decorate_line(log, regex) do
+    safe_line =
+      log.line
+      |> Phoenix.HTML.Engine.encode_to_iodata!()
+      |> IO.chardata_to_string()
+      |> then(&Regex.replace(regex, &1, "<em>\\1</em>"))
+
+    %{log | :line_decorated => {:safe, safe_line}}
+  end
 
   defp filtered_lines(regex) do
     Worker.list_entries()
@@ -95,7 +102,7 @@ defmodule Streamlog.IndexLive do
       <tbody id="log-list" phx-update="stream">
         <tr :for={{id, log} <- @streams.logs} id={id} class={if rem(log.id,2)==0, do: "even", else: "odd"}  >
           <td class="timestamp"><%= log.timestamp %></td>
-          <td class="message"><%= {:safe, log.line_decorated} %></td>
+          <td class="message"><%= log.line_decorated %></td>
         </tr>
       </tbody>
     </table>
@@ -155,7 +162,7 @@ defmodule Streamlog.Worker do
   @log_table :logs
 
   def start_link([]) do
-    :ets.new(:logs, [:set, :public, :named_table])
+    :ets.new(@log_table, [:set, :public, :named_table])
     GenServer.start_link(__MODULE__, [], name: __MODULE__)
   end
 
@@ -171,9 +178,10 @@ defmodule Streamlog.Worker do
   def handle_cast(:run, false) do
     :stdio
     |> IO.stream(:line)
+    |> Stream.filter(&(String.trim(&1) != ""))
     |> Stream.with_index(1)
     |> Stream.map(&create_log_entry/1)
-    |> Stream.each(&:ets.insert(:logs, {&1.id, &1}))
+    |> Stream.each(&:ets.insert(@log_table, {&1.id, &1}))
     |> Stream.each(&notify_subscribers/1)
     |> Stream.run()
 
@@ -188,7 +196,7 @@ defmodule Streamlog.Worker do
   defp notify_subscribers(line),
     do: Phoenix.PubSub.broadcast(PhoenixPlayground.PubSub, @topic, {:line, line})
 
-  def list_entries(), do: :ets.tab2list(:logs)
+  def list_entries(), do: :ets.tab2list(@log_table)
 end
 
 defmodule Streamlog.State do
