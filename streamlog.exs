@@ -79,6 +79,11 @@ defmodule Streamlog.IndexLive do
       table td {
         text-align: left;
       }
+
+      #log-list tr {
+        font-family: monospace;
+      }
+
     </style>
     <%= @inner_content %>
     """
