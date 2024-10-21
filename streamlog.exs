@@ -8,9 +8,9 @@ Application.put_env(:streamlog, Streamlog.Endpoint,
 Mix.install([
   {:plug_cowboy, "~> 2.5"},
   {:jason, "~> 1.0"},
-  {:phoenix, "~> 1.7.11", override: true},
-  {:phoenix_live_view, "~> 0.20.12"},
-  {:phoenix_live_dashboard, "~> 0.8.3"}
+  {:phoenix, "~> 1.7", override: true},
+  {:phoenix_live_view, "~> 0.20"},
+  {:phoenix_live_dashboard, "~> 0.8"}
 ])
 
 defmodule Streamlog.ErrorView do
