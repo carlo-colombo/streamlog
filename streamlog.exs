@@ -195,7 +195,7 @@ defmodule Streamlog.State do
     if query == nil do
       {nil, nil}
     else
-      case Regex.compile(query) do
+      case Regex.compile(query, [:caseless]) do
         {:ok, regex} -> {query, regex}
         _ -> {query, nil}
       end
