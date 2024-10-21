@@ -1,10 +1,3 @@
-Application.put_env(:streamlog, Streamlog.Endpoint,
-  http: [ip: {127, 0, 0, 1}, port: 5001],
-  server: true,
-  live_view: [signing_salt: "aaaaaaaa"],
-  secret_key_base: String.duplicate("a", 64)
-)
-
 Mix.install([
   {:plug_cowboy, "~> 2.5"},
   {:jason, "~> 1.0"},
@@ -27,10 +20,13 @@ defmodule Streamlog.IndexLive do
 
     {query, regex} = Streamlog.State.get_query_and_regex()
 
-    {:ok,
-     socket
-     |> stream(:logs, filtered_lines(regex))
-     |> assign(:form, to_form(%{"query" => query}))}
+    response =
+      socket
+      |> stream(:logs, filtered_lines(regex))
+      |> assign(:form, to_form(%{"query" => query}))
+      |> assign(:title, Application.get_env(:streamlog, Streamlog.Endpoint) |> Keyword.get(:title))
+
+    {:ok, response}
   end
 
   def handle_info({:line, line}, socket) do
@@ -71,6 +67,7 @@ defmodule Streamlog.IndexLive do
 
   def render("live.html", assigns) do
     ~H"""
+    <title><%= @title %></title>
     <script src="https://cdn.jsdelivr.net/npm/phoenix@1.7.11/priv/static/phoenix.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/phoenix_live_view@0.20.12/priv/static/phoenix_live_view.min.js"></script>
     <link rel="stylesheet" href="https://unpkg.com/mvp.css">
@@ -213,6 +210,16 @@ defmodule Streamlog.State do
     end
   end
 end
+
+{options, _, _} = OptionParser.parse(System.argv(), strict: [title: :string, port: :integer])
+
+Application.put_env(:streamlog, Streamlog.Endpoint,
+  http: [ip: {127, 0, 0, 1}, port: Keyword.get(options, :port, 5001)],
+  server: true,
+  live_view: [signing_salt: "aaaaaaaa"],
+  secret_key_base: String.duplicate("a", 64),
+  title: Keyword.get(options, :title, "Stream Log")
+)
 
 {:ok, _} =
   Supervisor.start_link(
