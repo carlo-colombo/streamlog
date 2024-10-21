@@ -84,13 +84,12 @@ defmodule Streamlog.IndexLive do
         </tr>
       </thead>
       <tbody id="log-list" phx-update="stream">
-        <tr :for={{id, log} <- @streams.logs} id={id} >
+        <tr :for={{id, log} <- @streams.logs} id={id} class={if rem(log.id,2)==0, do: "even", else: "odd"}  >
           <td class="timestamp"><%= log.timestamp %></td>
           <td class="message"><%= log.line %></td>
         </tr>
       </tbody>
     </table>
-    <link rel="stylesheet" href="https://unpkg.com/mvp.css">
     <style>
       :root {
         --color-accent: #118bee15;
@@ -109,8 +108,7 @@ defmodule Streamlog.IndexLive do
             text-align: left;
           }
         }
-
-        tr:nth-child(even) {
+        tr.odd {
           background-color: var(--color-accent);
         }
       }
@@ -160,8 +158,6 @@ defmodule Streamlog.Worker do
 
   @impl true
   def handle_cast(:run, false) do
-    IO.inspect(:run)
-
     :stdio
     |> IO.stream(:line)
     |> Stream.with_index(1)
@@ -219,18 +215,13 @@ Application.put_env(:streamlog, Streamlog.Endpoint,
   title: Keyword.get(options, :title, "Stream Log")
 )
 
-{:ok, _} = Supervisor.start_link(
-  [
-  ],
-  strategy: :one_for_one
-)
-
-{:ok, _} = PhoenixPlayground.start(
-  plug: Streamlog.Router,
-  child_specs: [
-    Streamlog.Worker,
-    {Streamlog.State, %{"query" => nil}}
-  ],
-  open_browser: false,
-  port: Keyword.get(options, :port, 5001)
-)
+{:ok, _} =
+  PhoenixPlayground.start(
+    plug: Streamlog.Router,
+    child_specs: [
+      Streamlog.Worker,
+      {Streamlog.State, %{"query" => nil}}
+    ],
+    open_browser: false,
+    port: Keyword.get(options, :port, 5001)
+  )
