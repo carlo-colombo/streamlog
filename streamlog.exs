@@ -25,22 +25,48 @@ defmodule Streamlog.IndexLive do
       Streamlog.Worker.run()
     end
 
-    lines =
-      :logs
-      |> :ets.tab2list()
-      |> Enum.sort(:desc)
-      |> Enum.map(&elem(&1, 1))
+    {query, regex} = Streamlog.State.get_query_and_regex()
 
     {:ok,
      socket
-     |> stream(:logs, lines)
-     |> assign(:form, to_form(%{"query" => nil}))}
+     |> stream(:logs, filtered_lines(regex))
+     |> assign(:form, to_form(%{"query" => query}))}
   end
 
   def handle_info({:line, line}, socket) do
+    {_, regex} = Streamlog.State.get_query_and_regex()
+
+    {:noreply,
+     if regex == nil or String.match?(line.line, regex) do
+       stream_insert(socket, :logs, line, at: 0)
+     else
+       socket
+     end}
+  end
+
+  def handle_event("filter", %{"query" => query} = params, socket) do
+    Streamlog.State.set(&%{&1 | "query" => query})
+
+    {_, regex} = Streamlog.State.get_query_and_regex()
+
     {:noreply,
      socket
-     |> stream_insert(:logs, line, at: 0)}
+     |> stream(:logs, filtered_lines(regex), reset: true)
+     |> assign(:form, to_form(params))}
+  end
+
+  defp filtered_lines(regex) do
+    :ets.tab2list(:logs)
+    |> Enum.map(&elem(&1, 1))
+    |> then(fn lines ->
+      if regex == nil do
+        lines
+      else
+        lines
+        |> Enum.filter(&String.match?(&1.line, regex))
+      end
+    end)
+    |> Enum.sort(:desc)
   end
 
   def render("live.html", assigns) do
@@ -61,16 +87,13 @@ defmodule Streamlog.IndexLive do
     """
   end
 
-  attr :field, Phoenix.HTML.FormField
-  attr :rest, :global, include: ~w(type)
+  attr(:field, Phoenix.HTML.FormField)
+  attr(:rest, :global, include: ~w(type))
+
   def input(assigns) do
     ~H"""
     <input id={@field.id} name={@field.name} value={@field.value} {@rest} />
     """
-  end
-
-  def handle_event("filter", %{"query" => query} = params, socket) do
-    {:noreply, assign(socket, form: to_form(params))}
   end
 
   def render(assigns) do
@@ -140,8 +163,8 @@ defmodule Streamlog.Worker do
     |> Stream.map(fn {line, index} ->
       %{id: index, line: line, timestamp: DateTime.now!("Etc/UTC")}
     end)
-    |> Stream.each(&notify_subscribers(&1))
     |> Stream.each(&:ets.insert(:logs, {&1.id, &1}))
+    |> Stream.each(&notify_subscribers(&1))
     |> Stream.run()
 
     {:noreply, :running}
@@ -160,12 +183,44 @@ defmodule Streamlog.Endpoint do
   plug(Streamlog.Router)
 end
 
+defmodule Streamlog.State do
+  use Agent
+
+  def start_link(initial_state) do
+    Agent.start_link(fn -> initial_state end, name: __MODULE__)
+  end
+
+  def value do
+    Agent.get(__MODULE__, & &1)
+  end
+
+  def set(update_fn) do
+    Agent.update(__MODULE__, &update_fn.(&1))
+  end
+
+  def get(key), do: Agent.get(__MODULE__, &Map.get(&1, key))
+
+  def get_query_and_regex do
+    query = get("query")
+
+    if query == nil do
+      {nil, nil}
+    else
+      case Regex.compile(query) do
+        {:ok, regex} -> {query, regex}
+        _ -> {query, nil}
+      end
+    end
+  end
+end
+
 {:ok, _} =
   Supervisor.start_link(
     [
       Streamlog.Endpoint,
       Streamlog.Worker,
-      {Phoenix.PubSub, name: :lines}
+      {Phoenix.PubSub, name: :lines},
+      {Streamlog.State, %{"query" => nil}}
     ],
     strategy: :one_for_one
   )
