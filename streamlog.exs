@@ -1,17 +1,21 @@
+#! /usr/bin/env elixir
+
 Mix.install([
   {:phoenix_playground, "~> 0.1.6"},
   {:phoenix_live_dashboard, "~> 0.8"}
 ])
 
+require Logger
+
 defmodule Streamlog.IndexLive do
   use Phoenix.LiveView
+  alias Streamlog.State
+  alias Streamlog.Worker
 
   def mount(_params, _session, socket) do
-    if connected?(socket) do
-      Streamlog.Worker.run()
-    end
+    if connected?(socket), do: Worker.run()
 
-    {query, regex} = Streamlog.State.get_query_and_regex()
+    {query, regex} = State.get_query_and_regex()
 
     response =
       socket
@@ -26,7 +30,7 @@ defmodule Streamlog.IndexLive do
   end
 
   def handle_info({:line, line}, socket) do
-    {_, regex} = Streamlog.State.get_query_and_regex()
+    {_, regex} = State.get_query_and_regex()
 
     {:noreply,
      if regex == nil or String.match?(line.line, regex) do
@@ -37,9 +41,9 @@ defmodule Streamlog.IndexLive do
   end
 
   def handle_event("filter", %{"query" => query} = params, socket) do
-    Streamlog.State.set(&%{&1 | "query" => query})
+    State.set(&%{&1 | "query" => query})
 
-    {_, regex} = Streamlog.State.get_query_and_regex()
+    {_, regex} = State.get_query_and_regex()
 
     {:noreply,
      socket
@@ -48,11 +52,13 @@ defmodule Streamlog.IndexLive do
   end
 
   defp decorate_line(log, nil), do: log
-  defp decorate_line(log, regex), do: %{log | :line_decorated => Regex.replace(regex, log.line, "<em>\\1</em>")}
+
+  defp decorate_line(log, regex),
+    do: %{log | :line_decorated => Regex.replace(regex, log.line, "<em>\\1</em>")}
 
   defp filtered_lines(regex) do
-    :ets.tab2list(:logs)
-    |> Enum.map(&elem(&1, 1))
+    Worker.list_entries()
+    |> Stream.map(&elem(&1, 1))
     |> then(fn lines ->
       if regex == nil or regex == "" do
         lines
@@ -60,7 +66,6 @@ defmodule Streamlog.IndexLive do
         lines
         |> Stream.filter(&String.match?(&1.line, regex))
         |> Stream.map(&decorate_line(&1, regex))
-        |> Enum.to_list
       end
     end)
     |> Enum.sort(:desc)
@@ -77,7 +82,6 @@ defmodule Streamlog.IndexLive do
 
   def render(assigns) do
     ~H"""
-    <h1>Logs</h1>
     <.form for={@form} phx-change="filter" >
       <.input type="text" field={@form[:query]} />
     </.form>
@@ -148,6 +152,7 @@ end
 defmodule Streamlog.Worker do
   use GenServer
   @topic inspect(__MODULE__)
+  @log_table :logs
 
   def start_link([]) do
     :ets.new(:logs, [:set, :public, :named_table])
@@ -155,9 +160,7 @@ defmodule Streamlog.Worker do
   end
 
   @impl true
-  def init([]) do
-    {:ok, false}
-  end
+  def init([]), do: {:ok, false}
 
   def run() do
     GenServer.cast(__MODULE__, :run)
@@ -169,11 +172,9 @@ defmodule Streamlog.Worker do
     :stdio
     |> IO.stream(:line)
     |> Stream.with_index(1)
-    |> Stream.map(fn {line, index} ->
-      %{id: index, line: line, timestamp: DateTime.now!("Etc/UTC"), line_decorated: line}
-    end)
+    |> Stream.map(&create_log_entry/1)
     |> Stream.each(&:ets.insert(:logs, {&1.id, &1}))
-    |> Stream.each(&notify_subscribers(&1))
+    |> Stream.each(&notify_subscribers/1)
     |> Stream.run()
 
     {:noreply, :running}
@@ -181,9 +182,13 @@ defmodule Streamlog.Worker do
 
   def handle_cast(:run, :running), do: {:noreply, :running}
 
-  defp notify_subscribers(line) do
-    Phoenix.PubSub.broadcast(PhoenixPlayground.PubSub, @topic, {:line, line})
-  end
+  defp create_log_entry({line, index}),
+    do: %{id: index, line: line, timestamp: DateTime.now!("Etc/UTC"), line_decorated: line}
+
+  defp notify_subscribers(line),
+    do: Phoenix.PubSub.broadcast(PhoenixPlayground.PubSub, @topic, {:line, line})
+
+  def list_entries(), do: :ets.tab2list(:logs)
 end
 
 defmodule Streamlog.State do
@@ -215,17 +220,21 @@ end
   OptionParser.parse(System.argv(),
     strict: [
       title: :string,
-      port: :integer
+      port: :integer,
+      open: :boolean
     ]
   )
 
 options =
   Keyword.validate!(options,
     title: "Stream Log",
-    port: 5051
+    port: 5051,
+    open: false
   )
 
 Application.put_env(:streamlog, :title, Keyword.fetch!(options, :title))
+
+Logger.info("Streamlog starting with the following options: #{inspect(options)}")
 
 {:ok, _} =
   PhoenixPlayground.start(
@@ -235,6 +244,6 @@ Application.put_env(:streamlog, :title, Keyword.fetch!(options, :title))
       Streamlog.Worker,
       {Streamlog.State, %{"query" => nil}}
     ],
-    open_browser: false,
+    open_browser: Keyword.fetch!(options, :open),
     port: Keyword.fetch!(options, :port)
   )
