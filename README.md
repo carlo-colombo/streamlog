@@ -1,8 +1,12 @@
 # streamlog
 
-Local log viewer supporting filtering and highlighting all in a single elixir script, using Phoenix Live View.
+Local log viewer supporting filtering and highlighting all in a single elixir script, using Phoenix Live View through `phoenix_playground`.
+
+Filtering supports using regex
 
 ## Usage
+
+Download `streamlog.exs` and ensure is executable `chmod+x`
 
 ```bash
 tail -f some-log-file | <path-to>/streamlog.exs --open --port 9090 --title 'some-log-file logs'
@@ -22,5 +26,10 @@ tail -f some-log-file | <path-to>/streamlog.exs --open --port 9090 --title 'some
 ## Technicalities
 
 * logs are stored in an ets table
-* streamlog exposes a live dashboard on `/dashboard` for debug purpose and curiosity 
+* streamlog exposes Phoenix Live Dashboard on `/dashboard` for debug purpose and curiosity 
 
+## Example
+
+The default `ngnix` container tested with `k6` to generate multiple different requests.
+
+![streamlog filtering ngnix logs](./streamlog-s.gif)

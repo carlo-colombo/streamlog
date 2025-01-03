@@ -52,7 +52,6 @@ defmodule Streamlog.IndexLive do
   end
 
   defp decorate_line(log, nil), do: log
-
   defp decorate_line(log, regex) do
     safe_line =
       log.line
