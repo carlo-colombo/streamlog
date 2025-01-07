@@ -5,6 +5,10 @@ Local log viewer supporting filtering and highlighting all in a single elixir sc
 * Regex based filtering and highlighting
 * Filtered out logs are retained (until streamlog runs)
 
+```bash
+tail -f some-log-file | <path-to>/streamlog.exs --open --port 9090 --title 'some-log-file logs'
+```
+
 ![streamlog filtering ngnix logs](./streamlog-s.gif)
 
 ## Usage
@@ -14,6 +18,8 @@ Download `streamlog.exs` and ensure is executable `chmod+x`
 ```bash
 tail -f some-log-file | <path-to>/streamlog.exs --open --port 9090 --title 'some-log-file logs'
 ```
+
+or
 
 ```bash
 ./some-program-loggin-on-stdout | <path-to>/streamlog.exs --port 9091 --title 'program logs'
