@@ -34,14 +34,16 @@ defmodule Streamlog.IndexLive do
   def handle_info({:line, line}, socket) do
     {_, regex} = State.get_query_and_regex()
 
-    {:noreply,
-     with false <- is_nil(regex),
-          {:ok, re} <- Regex.compile(regex),
+    {:noreply, if not is_nil(regex) do
+     with {:ok, re} <- Regex.compile(regex),
           true <- String.match?(line.line, re) do
        stream_insert(socket, :logs, decorate_line(line, re), at: 0)
      else
        _ -> socket
-     end}
+     end
+    else
+      stream_insert(socket, :logs, line, at: 0)
+    end}
   end
 
   def handle_event("filter", %{"query" => query} = params, socket) do
