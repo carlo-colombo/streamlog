@@ -35,10 +35,12 @@ defmodule Streamlog.IndexLive do
     {_, regex} = State.get_query_and_regex()
 
     {:noreply,
-     if regex == nil or String.match?(line.line, regex) do
-       stream_insert(socket, :logs, decorate_line(line, regex), at: 0)
+     with false <- is_nil(regex),
+          {:ok, re} <- Regex.compile(regex),
+          true <- String.match?(line.line, re) do
+       stream_insert(socket, :logs, decorate_line(line, re), at: 0)
      else
-       socket
+       _ -> socket
      end}
   end
 
@@ -58,6 +60,7 @@ defmodule Streamlog.IndexLive do
       log.line
       |> Phoenix.HTML.Engine.encode_to_iodata!()
       |> IO.chardata_to_string()
+      |> then(&Regex.replace(regex, &1, "<em>\\0</em>"))
 
     %{log | :line_decorated => {:safe, safe_line}}
   end
@@ -104,7 +107,7 @@ defmodule Streamlog.IndexLive do
         text-align: left;
         font-family: monospace;
         display: table;
-        mi  n-width: 100%;
+        min-width: 100%;
 
         td {
           padding-right: 10px;
@@ -168,7 +171,9 @@ defmodule Streamlog.LogIngester do
     :ok =
       db
       |> Sqlite3.execute(
-        "CREATE TABLE IF NOT EXISTS logs (id integer primary key, line text, timestamp text)"
+        "CREATE TABLE IF NOT EXISTS logs (id integer primary key, line text, timestamp text);
+         CREATE INDEX logs_idx_4a224123 ON logs(timestamp DESC);
+        "
       )
 
     {:ok, insert_stm} =
