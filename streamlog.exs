@@ -2,7 +2,9 @@
 
 Mix.install([
   {:phoenix_playground, "~> 0.1.6"},
-  {:phoenix_live_dashboard, "~> 0.8"}
+  {:phoenix_live_dashboard, "~> 0.8"},
+  {:ex_sqlean, "~> 0.8.7"},
+  {:exqlite, "~> 0.27"}
 ])
 
 require Logger
@@ -10,10 +12,10 @@ require Logger
 defmodule Streamlog.IndexLive do
   use Phoenix.LiveView
   alias Streamlog.State
-  alias Streamlog.Worker
+  alias Streamlog.LogIngester
 
   def mount(_params, _session, socket) do
-    if connected?(socket), do: Worker.run()
+    if connected?(socket), do: LogIngester.run()
 
     {query, regex} = State.get_query_and_regex()
 
@@ -52,6 +54,7 @@ defmodule Streamlog.IndexLive do
   end
 
   defp decorate_line(log, nil), do: log
+
   defp decorate_line(log, regex) do
     safe_line =
       log.line
@@ -63,7 +66,7 @@ defmodule Streamlog.IndexLive do
   end
 
   defp filtered_lines(regex) do
-    Worker.list_entries()
+    LogIngester.list_entries()
     |> Stream.map(&elem(&1, 1))
     |> then(fn lines ->
       if regex == nil or regex == "" do
@@ -155,39 +158,70 @@ defmodule Streamlog.Router do
   end
 end
 
-defmodule Streamlog.Worker do
+defmodule Streamlog.LogIngester do
   use GenServer
+  alias Exqlite.Sqlite3
+  alias Exqlite.Basic
+
   @topic inspect(__MODULE__)
-  @log_table :logs
 
   def start_link([]) do
-    :ets.new(@log_table, [:set, :public, :named_table])
     GenServer.start_link(__MODULE__, [], name: __MODULE__)
   end
 
   @impl true
-  def init([]), do: {:ok, false}
+  def init([]) do
+    {:ok, conn = %{db: db}} = Basic.open(":memory:")
+
+    :ok = Basic.enable_load_extension(conn)
+    :ok = Basic.load_extension(conn, ExSqlean.path_for("re"))
+    :ok = Basic.disable_load_extension(conn)
+
+    :ok =
+      db
+      |> Sqlite3.execute(
+        "CREATE TABLE IF NOT EXISTS logs (id integer primary key, line text, timestamp text)"
+      )
+
+    {:ok, insert_stm} =
+      db
+      |> Sqlite3.prepare("INSERT INTO logs (id, line, timestamp) VALUES (?1, ?2, ?3)")
+
+    {:ok, select_stm} = Sqlite3.prepare(db, "SELECT id, line, timestamp FROM logs")
+
+    Task.start(fn ->
+      :stdio
+      |> IO.stream(:line)
+      |> Stream.filter(&(String.trim(&1) != ""))
+      |> Stream.with_index(1)
+      |> Stream.map(&create_log_entry/1)
+      |> Stream.each(fn entry ->
+        :ok = Exqlite.Sqlite3.bind(insert_stm, [entry.id, entry.line, entry.timestamp])
+        :done = Exqlite.Sqlite3.step(db, insert_stm)
+      end)
+      |> Stream.each(&notify_subscribers/1)
+      |> Stream.run()
+    end)
+
+    {:ok, %{db: db, insert_stm: insert_stm, select_stm: select_stm}}
+  end
 
   def run() do
-    GenServer.cast(__MODULE__, :run)
     Phoenix.PubSub.subscribe(PhoenixPlayground.PubSub, @topic)
   end
 
   @impl true
-  def handle_cast(:run, false) do
-    :stdio
-    |> IO.stream(:line)
-    |> Stream.filter(&(String.trim(&1) != ""))
-    |> Stream.with_index(1)
-    |> Stream.map(&create_log_entry/1)
-    |> Stream.each(&:ets.insert(@log_table, {&1.id, &1}))
-    |> Stream.each(&notify_subscribers/1)
-    |> Stream.run()
+  def handle_call(:get_all, _from, state = %{db: db, select_stm: select_stm}) do
+    records =
+      with {:ok, rows} <- Sqlite3.fetch_all(db, select_stm) do
+        rows
+        |> Stream.map(fn [id, line, timestamp] ->
+          {id, %{id: id, line: line, timestamp: timestamp, line_decorated: line}}
+        end)
+      end
 
-    {:noreply, :running}
+    {:reply, Enum.to_list(records), state}
   end
-
-  def handle_cast(:run, :running), do: {:noreply, :running}
 
   defp create_log_entry({line, index}),
     do: %{id: index, line: line, timestamp: DateTime.now!("Etc/UTC"), line_decorated: line}
@@ -195,7 +229,7 @@ defmodule Streamlog.Worker do
   defp notify_subscribers(line),
     do: Phoenix.PubSub.broadcast(PhoenixPlayground.PubSub, @topic, {:line, line})
 
-  def list_entries(), do: :ets.tab2list(@log_table)
+  def list_entries(), do: GenServer.call(__MODULE__, :get_all)
 end
 
 defmodule Streamlog.State do
@@ -248,7 +282,7 @@ Logger.info("Streamlog starting with the following options: #{inspect(options)}"
     plug: Streamlog.Router,
     live_reload: false,
     child_specs: [
-      Streamlog.Worker,
+      Streamlog.LogIngester,
       {Streamlog.State, %{"query" => nil}}
     ],
     open_browser: Keyword.fetch!(options, :open),
