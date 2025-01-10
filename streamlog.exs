@@ -156,12 +156,12 @@ defmodule Streamlog.LogIngester do
 
   @topic inspect(__MODULE__)
 
-  def start_link([]) do
-    GenServer.start_link(__MODULE__, [], name: __MODULE__)
+  def start_link(init) do
+    GenServer.start_link(__MODULE__, init ,name: __MODULE__)
   end
 
   @impl true
-  def init([]) do
+  def init(%{limit: limit}) do
     {:ok, conn = %{db: db}} = Basic.open(":memory:")
 
     :ok = Basic.enable_load_extension(conn)
@@ -194,12 +194,13 @@ defmodule Streamlog.LogIngester do
       |> Stream.run()
     end)
 
-    {:ok, %{db: db}}
+    {:ok, %{db: db, limit: limit}}
   end
 
+  @impl
   def handle_call({:filter, regex}, from, state = %{db: db}) do
     records =
-      with {:ok, select_stm} <- prepare_query(db, regex),
+      with {:ok, select_stm} <- prepare_query(state, regex),
            {:ok, rows} <- Sqlite3.fetch_all(db, select_stm) do
         rows
         |> Stream.map(&to_record/1)
@@ -215,27 +216,33 @@ defmodule Streamlog.LogIngester do
 
   def list_entries(regex), do: GenServer.call(__MODULE__, {:filter, regex})
 
-  defp prepare_query(db, regex) when regex == nil or regex == "" do
-    Sqlite3.prepare(
-      db,
-      "SELECT id, line, timestamp, line
-      FROM logs
-      ORDER BY id DESC"
-    )
+  defp prepare_query(%{db: db, limit: limit}, regex) when regex == nil or regex == "" do
+    with {:ok, select_stm} <-
+           Sqlite3.prepare(
+             db,
+             "SELECT id, line, timestamp, line
+              FROM logs
+              ORDER BY id DESC
+              LIMIT ?1"
+           ),
+         :ok = Exqlite.Sqlite3.bind(select_stm, [limit]) do
+      {:ok, select_stm}
+    end
   end
 
-  defp prepare_query(db, regex) when is_binary(regex) do
-    {:ok, select_stm} =
-      Sqlite3.prepare(
-        db,
-        "SELECT id, line, timestamp, regexp_replace(line, ?1, '<em>$0</em>')
-        FROM logs
-        WHERE regexp_like(line, ?1)
-        ORDER BY id DESC"
-      )
-
-    :ok = Exqlite.Sqlite3.bind(select_stm, [regex])
-    {:ok, select_stm}
+  defp prepare_query(%{db: db, limit: limit}, regex) when is_binary(regex) do
+    with {:ok, select_stm} <-
+           Sqlite3.prepare(
+             db,
+             "SELECT id, line, timestamp, regexp_replace(line, ?1, '<em>$0</em>')
+              FROM logs
+              WHERE regexp_like(line, ?1)
+              ORDER BY id DESC
+              LIMIT ?2"
+           ),
+         :ok = Exqlite.Sqlite3.bind(select_stm, [regex, limit]) do
+      {:ok, select_stm}
+    end
   end
 
   defp prepare_query(db, regex) do
@@ -277,7 +284,8 @@ end
     strict: [
       title: :string,
       port: :integer,
-      open: :boolean
+      open: :boolean,
+      limit: :integer
     ]
   )
 
@@ -285,7 +293,8 @@ options =
   Keyword.validate!(options,
     title: "Stream Log",
     port: 5051,
-    open: false
+    open: false,
+    limit: 5000
   )
 
 Application.put_env(:streamlog, :title, Keyword.fetch!(options, :title))
@@ -297,7 +306,7 @@ Logger.info("Streamlog starting with the following options: #{inspect(options)}"
     plug: Streamlog.Router,
     live_reload: false,
     child_specs: [
-      Streamlog.LogIngester,
+      {Streamlog.LogIngester, %{limit: Keyword.fetch!(options, :limit)}},
       {Streamlog.State, %{"query" => nil}}
     ],
     open_browser: Keyword.fetch!(options, :open),
