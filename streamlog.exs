@@ -17,11 +17,11 @@ defmodule Streamlog.IndexLive do
   def mount(_params, _session, socket) do
     if connected?(socket), do: LogIngester.run()
 
-    {query, regex} = State.get_query_and_regex()
+    {query, _} = State.get_query_and_regex()
 
     response =
       socket
-      |> stream(:logs, filtered_lines(regex))
+      |> stream(:logs, filtered_lines())
       |> assign(:form, to_form(%{"query" => query}))
       |> assign(
         :page_title,
@@ -45,11 +45,9 @@ defmodule Streamlog.IndexLive do
   def handle_event("filter", %{"query" => query} = params, socket) do
     State.set(&%{&1 | "query" => query})
 
-    {_, regex} = State.get_query_and_regex()
-
     {:noreply,
      socket
-     |> stream(:logs, filtered_lines(regex), reset: true)
+     |> stream(:logs, filtered_lines(), reset: true)
      |> assign(:form, to_form(params))}
   end
 
@@ -60,24 +58,14 @@ defmodule Streamlog.IndexLive do
       log.line
       |> Phoenix.HTML.Engine.encode_to_iodata!()
       |> IO.chardata_to_string()
-      |> then(&Regex.replace(regex, &1, "<em>\\1</em>"))
 
     %{log | :line_decorated => {:safe, safe_line}}
   end
 
-  defp filtered_lines(regex) do
-    LogIngester.list_entries()
-    |> Stream.map(&elem(&1, 1))
-    |> then(fn lines ->
-      if regex == nil or regex == "" do
-        lines
-      else
-        lines
-        |> Stream.filter(&String.match?(&1.line, regex))
-        |> Stream.map(&decorate_line(&1, regex))
-      end
-    end)
-    |> Enum.sort(:desc)
+  defp filtered_lines() do
+    {regex, compiled_regex} = State.get_query_and_regex()
+
+    LogIngester.list_entries(compiled_regex)
   end
 
   attr(:field, Phoenix.HTML.FormField)
@@ -125,11 +113,11 @@ defmodule Streamlog.IndexLive do
           &.message {
             text-align: left;
             em {
-              background-color: lightyellow;
+              background-color: yellow;
             }
           }
         }
-        tr.odd {
+        tr:nth-child(odd) {
           background-color: var(--color-accent);
         }
       }
@@ -174,7 +162,7 @@ defmodule Streamlog.LogIngester do
     {:ok, conn = %{db: db}} = Basic.open(":memory:")
 
     :ok = Basic.enable_load_extension(conn)
-    :ok = Basic.load_extension(conn, ExSqlean.path_for("re"))
+    {:ok, _, _, _} = Basic.load_extension(conn, "./regexp.dylib")
     :ok = Basic.disable_load_extension(conn)
 
     :ok =
@@ -186,8 +174,6 @@ defmodule Streamlog.LogIngester do
     {:ok, insert_stm} =
       db
       |> Sqlite3.prepare("INSERT INTO logs (id, line, timestamp) VALUES (?1, ?2, ?3)")
-
-    {:ok, select_stm} = Sqlite3.prepare(db, "SELECT id, line, timestamp FROM logs")
 
     Task.start(fn ->
       :stdio
@@ -203,33 +189,62 @@ defmodule Streamlog.LogIngester do
       |> Stream.run()
     end)
 
-    {:ok, %{db: db, insert_stm: insert_stm, select_stm: select_stm}}
+    {:ok, %{db: db}}
   end
 
-  def run() do
-    Phoenix.PubSub.subscribe(PhoenixPlayground.PubSub, @topic)
-  end
-
-  @impl true
-  def handle_call(:get_all, _from, state = %{db: db, select_stm: select_stm}) do
+  def handle_call({:filter, regex}, from, state = %{db: db}) do
     records =
-      with {:ok, rows} <- Sqlite3.fetch_all(db, select_stm) do
+      with {:ok, select_stm} <- prepare_query(db, regex),
+           {:ok, rows} <- Sqlite3.fetch_all(db, select_stm) do
         rows
-        |> Stream.map(fn [id, line, timestamp] ->
-          {id, %{id: id, line: line, timestamp: timestamp, line_decorated: line}}
-        end)
+        |> Stream.map(&to_record/1)
+        |> Enum.to_list()
+      else
+        {:error, "invalid regexp pattern"} -> []
       end
 
-    {:reply, Enum.to_list(records), state}
+    {:reply, records, state}
+  end
+
+  def run, do: Phoenix.PubSub.subscribe(PhoenixPlayground.PubSub, @topic)
+
+  def list_entries(regex), do: GenServer.call(__MODULE__, {:filter, regex})
+
+  defp prepare_query(db, regex) when regex == nil or regex == "" do
+    Sqlite3.prepare(
+      db,
+      "SELECT id, line, timestamp, line
+      FROM logs
+      ORDER BY id DESC"
+    )
+  end
+
+  defp prepare_query(db, regex) when is_binary(regex) do
+    {:ok, select_stm} =
+      Sqlite3.prepare(
+        db,
+        "SELECT id, line, timestamp, regexp_replace(line, ?1, '<em>$0</em>')
+        FROM logs
+        WHERE regexp_like(line, ?1)
+        ORDER BY id DESC"
+      )
+
+    :ok = Exqlite.Sqlite3.bind(select_stm, [regex])
+    {:ok, select_stm}
+  end
+
+  defp prepare_query(db, regex) do
+    {:error, "invalid regexp pattern"}
   end
 
   defp create_log_entry({line, index}),
     do: %{id: index, line: line, timestamp: DateTime.now!("Etc/UTC"), line_decorated: line}
 
+  defp to_record([id, line, timestamp, line_decorated]),
+    do: %{id: id, line: line, timestamp: timestamp, line_decorated: {:safe, line_decorated}}
+
   defp notify_subscribers(line),
     do: Phoenix.PubSub.broadcast(PhoenixPlayground.PubSub, @topic, {:line, line})
-
-  def list_entries(), do: GenServer.call(__MODULE__, :get_all)
 end
 
 defmodule Streamlog.State do
@@ -239,20 +254,15 @@ defmodule Streamlog.State do
     Agent.start_link(fn -> initial_state end, name: __MODULE__)
   end
 
-  def value, do: Agent.get(__MODULE__, & &1)
   def set(update_fn), do: Agent.update(__MODULE__, &update_fn.(&1))
-  def get(key), do: Agent.get(__MODULE__, &Map.get(&1, key))
 
   def get_query_and_regex do
-    query = get("query")
+    query = Agent.get(__MODULE__, &Map.get(&1, "query"))
 
     if query == nil or query == "" do
       {nil, nil}
     else
-      case Regex.compile("(#{query})", [:caseless]) do
-        {:ok, regex} -> {query, regex}
-        _ -> {query, nil}
-      end
+      {query, "(?i)#{query}"}
     end
   end
 end
