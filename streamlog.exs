@@ -3,8 +3,8 @@
 Mix.install([
   {:phoenix_playground, "~> 0.1.6"},
   {:phoenix_live_dashboard, "~> 0.8"},
-  {:ex_sqlean, "~> 0.8.7"},
-  {:exqlite, "~> 0.27"}
+  {:exqlite, "~> 0.27"},
+  {:ex_sqlean_compiled, github: "carlo-colombo/ex_sqlean_compiled", submodules: true}
 ])
 
 require Logger
@@ -34,16 +34,17 @@ defmodule Streamlog.IndexLive do
   def handle_info({:line, line}, socket) do
     {_, regex} = State.get_query_and_regex()
 
-    {:noreply, if not is_nil(regex) do
-     with {:ok, re} <- Regex.compile(regex),
-          true <- String.match?(line.line, re) do
-       stream_insert(socket, :logs, decorate_line(line, re), at: 0)
+    {:noreply,
+     if not is_nil(regex) do
+       with {:ok, re} <- Regex.compile(regex),
+            true <- String.match?(line.line, re) do
+         stream_insert(socket, :logs, decorate_line(line, re), at: 0)
+       else
+         _ -> socket
+       end
      else
-       _ -> socket
-     end
-    else
-      stream_insert(socket, :logs, line, at: 0)
-    end}
+       stream_insert(socket, :logs, line, at: 0)
+     end}
   end
 
   def handle_event("filter", %{"query" => query} = params, socket) do
@@ -68,7 +69,7 @@ defmodule Streamlog.IndexLive do
   end
 
   defp filtered_lines() do
-    {regex, compiled_regex} = State.get_query_and_regex()
+    {_, compiled_regex} = State.get_query_and_regex()
 
     LogIngester.list_entries(compiled_regex)
   end
@@ -159,7 +160,7 @@ defmodule Streamlog.LogIngester do
   @topic inspect(__MODULE__)
 
   def start_link(init) do
-    GenServer.start_link(__MODULE__, init ,name: __MODULE__)
+    GenServer.start_link(__MODULE__, init, name: __MODULE__)
   end
 
   @impl true
@@ -167,7 +168,7 @@ defmodule Streamlog.LogIngester do
     {:ok, conn = %{db: db}} = Basic.open(":memory:")
 
     :ok = Basic.enable_load_extension(conn)
-    {:ok, _, _, _} = Basic.load_extension(conn, "./regexp.dylib")
+    {:ok, _, _, _} = Basic.load_extension(conn, ExSqleanCompiled.path_for_module("regexp"))
     :ok = Basic.disable_load_extension(conn)
 
     :ok =
@@ -178,11 +179,11 @@ defmodule Streamlog.LogIngester do
         "
       )
 
-    {:ok, insert_stm} =
-      db
-      |> Sqlite3.prepare("INSERT INTO logs (id, line, timestamp) VALUES (?1, ?2, ?3)")
-
     Task.start(fn ->
+      {:ok, insert_stm} =
+        db
+        |> Sqlite3.prepare("INSERT INTO logs (id, line, timestamp) VALUES (?1, ?2, ?3)")
+
       :stdio
       |> IO.stream(:line)
       |> Stream.filter(&(String.trim(&1) != ""))
@@ -199,16 +200,18 @@ defmodule Streamlog.LogIngester do
     {:ok, %{db: db, limit: limit}}
   end
 
-  @impl
-  def handle_call({:filter, regex}, from, state = %{db: db}) do
+  @impl true
+  def handle_call({:filter, regex}, _from, state = %{db: db}) do
     records =
-      with {:ok, select_stm} <- prepare_query(state, regex),
+      with {:ok, select_stm} <- prepare_query(state, regex || ""),
            {:ok, rows} <- Sqlite3.fetch_all(db, select_stm) do
         rows
         |> Stream.map(&to_record/1)
         |> Enum.to_list()
       else
-        {:error, "invalid regexp pattern"} -> []
+        {:error, message} ->
+          IO.inspect(message)
+          []
       end
 
     {:reply, records, state}
@@ -218,7 +221,7 @@ defmodule Streamlog.LogIngester do
 
   def list_entries(regex), do: GenServer.call(__MODULE__, {:filter, regex})
 
-  defp prepare_query(%{db: db, limit: limit}, regex) when regex == nil or regex == "" do
+  defp prepare_query(%{db: db, limit: limit}, "") do
     with {:ok, select_stm} <-
            Sqlite3.prepare(
              db,
@@ -232,7 +235,7 @@ defmodule Streamlog.LogIngester do
     end
   end
 
-  defp prepare_query(%{db: db, limit: limit}, regex) when is_binary(regex) do
+  defp prepare_query(%{db: db, limit: limit}, regex) do
     with {:ok, select_stm} <-
            Sqlite3.prepare(
              db,
@@ -247,9 +250,7 @@ defmodule Streamlog.LogIngester do
     end
   end
 
-  defp prepare_query(db, regex) do
-    {:error, "invalid regexp pattern"}
-  end
+  defp prepare_query(_db, _regex), do: {:error, nil}
 
   defp create_log_entry({line, index}),
     do: %{id: index, line: line, timestamp: DateTime.now!("Etc/UTC"), line_decorated: line}
