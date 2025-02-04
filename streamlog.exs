@@ -9,6 +9,10 @@ Mix.install([
 
 require Logger
 
+defmodule Streamlog do
+  def highlight(t), do: IO.ANSI.yellow_background() <> t <> IO.ANSI.reset()
+end
+
 defmodule Streamlog.IndexLive do
   use Phoenix.LiveView
   alias Streamlog.State
@@ -63,7 +67,7 @@ defmodule Streamlog.IndexLive do
       log.line
       |> Phoenix.HTML.Engine.encode_to_iodata!()
       |> IO.chardata_to_string()
-      |> then(&Regex.replace(regex, &1, "<em>\\0</em>"))
+      |> then(&Regex.replace(regex, &1, Streamlog.highlight("\\0")))
 
     %{log | :line_decorated => {:safe, safe_line}}
   end
@@ -96,7 +100,7 @@ defmodule Streamlog.IndexLive do
         </tr>
       </thead>
       <tbody id="log-list" phx-update="stream">
-        <tr :for={{id, log} <- @streams.logs} id={id} class={if rem(log.id,2)==0, do: "even", else: "odd"}  >
+        <tr :for={{id, log} <- @streams.logs} id={id} class={if rem(log.id,2)==0, do: "even", else: "odd"}  phx-hook="Decorate">
           <td class="timestamp"><%= log.timestamp %></td>
           <td class="message"><%= log.line_decorated %></td>
         </tr>
@@ -105,6 +109,7 @@ defmodule Streamlog.IndexLive do
     <style>
       :root {
         --color-accent: #118bee15;
+        --ansi-yellow: yellow;
       }
       table {
         text-align: left;
@@ -128,6 +133,21 @@ defmodule Streamlog.IndexLive do
         }
       }
     </style>
+    <script type="module">
+      import * as fancyAnsi from 'https://esm.run/fancy-ansi';
+
+      const fa = new fancyAnsi.FancyAnsi();
+
+      window.hooks.Decorate = {
+        mounted() {
+          const msg = this.el.querySelector('.message')
+          var html = fa.toHtml(msg.innerText);
+          msg.innerHTML = html
+        },
+        updated() {this.mounted()}
+      }
+
+    </script>
     """
   end
 end
@@ -239,7 +259,7 @@ defmodule Streamlog.LogIngester do
     with {:ok, select_stm} <-
            Sqlite3.prepare(
              db,
-             "SELECT id, line, timestamp, regexp_replace(line, ?1, '<em>$0</em>')
+             "SELECT id, line, timestamp, regexp_replace(line, ?1, '#{Streamlog.highlight("$0")}')
               FROM logs
               WHERE regexp_like(line, ?1)
               ORDER BY id DESC
