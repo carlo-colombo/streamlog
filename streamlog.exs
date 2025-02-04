@@ -288,7 +288,8 @@ end
       title: :string,
       port: :integer,
       open: :boolean,
-      limit: :integer
+      limit: :integer,
+      query: :string
     ]
   )
 
@@ -297,7 +298,8 @@ options =
     title: "Stream Log",
     port: 5051,
     open: false,
-    limit: 5000
+    limit: 5000,
+    query: nil
   )
 
 Application.put_env(:streamlog, :title, Keyword.fetch!(options, :title))
@@ -310,7 +312,7 @@ Logger.info("Streamlog starting with the following options: #{inspect(options)}"
     live_reload: false,
     child_specs: [
       {Streamlog.LogIngester, %{limit: Keyword.fetch!(options, :limit)}},
-      {Streamlog.State, %{"query" => nil}}
+      {Streamlog.State, %{"query" => Keyword.fetch!(options, :query)}}
     ],
     open_browser: Keyword.fetch!(options, :open),
     port: Keyword.fetch!(options, :port)
