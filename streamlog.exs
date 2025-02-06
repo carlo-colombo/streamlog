@@ -9,8 +9,15 @@ Mix.install([
 
 require Logger
 
-defmodule Streamlog do
-  def highlight(t), do: IO.ANSI.yellow_background() <> t <> IO.ANSI.reset()
+defmodule MyAnsi do
+  @ansi_regex ~r/(\x9B|\x1B\[)[0-?]*[ -\/]*[@-~]/
+  @non_alpha_regex ~r/[^0-9a-zA-Z]/
+
+  def strip_ansi(ansi_string) when is_binary(ansi_string) do
+    Regex.replace(@ansi_regex, ansi_string, "")
+    |> String.split(",")
+    |> Enum.map(&Regex.replace(@non_alpha_regex, &1, ""))
+  end
 end
 
 defmodule Streamlog.IndexLive do
@@ -36,19 +43,7 @@ defmodule Streamlog.IndexLive do
   end
 
   def handle_info({:line, line}, socket) do
-    {_, regex} = State.get_query_and_regex()
-
-    {:noreply,
-     if not is_nil(regex) do
-       with {:ok, re} <- Regex.compile(regex),
-            true <- String.match?(line.line, re) do
-         stream_insert(socket, :logs, decorate_line(line, re), at: 0)
-       else
-         _ -> socket
-       end
-     else
-       stream_insert(socket, :logs, line, at: 0)
-     end}
+    {:noreply, stream_insert(socket, :logs, line, at: 0)}
   end
 
   def handle_event("filter", %{"query" => query} = params, socket) do
@@ -58,18 +53,6 @@ defmodule Streamlog.IndexLive do
      socket
      |> stream(:logs, filtered_lines(), reset: true)
      |> assign(:form, to_form(params))}
-  end
-
-  defp decorate_line(log, nil), do: log
-
-  defp decorate_line(log, regex) do
-    safe_line =
-      log.line
-      |> Phoenix.HTML.Engine.encode_to_iodata!()
-      |> IO.chardata_to_string()
-      |> then(&Regex.replace(regex, &1, Streamlog.highlight("\\0")))
-
-    %{log | :line_decorated => {:safe, safe_line}}
   end
 
   defp filtered_lines() do
@@ -120,6 +103,10 @@ defmodule Streamlog.IndexLive do
         td {
           padding-right: 10px;
           border-right: solid 1px #339981;
+
+          &.timestamp {
+            min-width: 250px;
+          }
 
           &.message {
             text-align: left;
@@ -176,6 +163,7 @@ defmodule Streamlog.LogIngester do
   use GenServer
   alias Exqlite.Sqlite3
   alias Exqlite.Basic
+  alias Streamlog.State
 
   @topic inspect(__MODULE__)
 
@@ -199,6 +187,8 @@ defmodule Streamlog.LogIngester do
         "
       )
 
+    Sqlite3.set_update_hook(db, self())
+
     Task.start(fn ->
       {:ok, insert_stm} =
         db
@@ -213,7 +203,6 @@ defmodule Streamlog.LogIngester do
         :ok = Exqlite.Sqlite3.bind(insert_stm, [entry.id, entry.line, entry.timestamp])
         :done = Exqlite.Sqlite3.step(db, insert_stm)
       end)
-      |> Stream.each(&notify_subscribers/1)
       |> Stream.run()
     end)
 
@@ -237,31 +226,44 @@ defmodule Streamlog.LogIngester do
     {:reply, records, state}
   end
 
+  @impl true
+  def handle_info({:insert, _, _, id}, state = %{db: db}) do
+    {_, regex} = State.get_query_and_regex()
+
+    with {:ok, select_stm} <- prepare_query(state, regex || "", [id]),
+         result <- Sqlite3.step(db, select_stm) do
+      case result do
+        {:row, row} -> row |> to_record() |> notify_subscribers()
+        :done -> nil
+      end
+    else
+      {:error, message} ->
+        Logger.error(inspect(message))
+        []
+    end
+
+    {:noreply, state}
+  end
+
   def run, do: Phoenix.PubSub.subscribe(PhoenixPlayground.PubSub, @topic)
 
   def list_entries(regex), do: GenServer.call(__MODULE__, {:filter, regex})
 
-  defp prepare_query(%{db: db, limit: limit}, "") do
-    with {:ok, select_stm} <-
-           Sqlite3.prepare(
-             db,
-             "SELECT id, line, timestamp, line
-              FROM logs
-              ORDER BY id DESC
-              LIMIT ?1"
-           ),
-         :ok = Exqlite.Sqlite3.bind(select_stm, [limit]) do
-      {:ok, select_stm}
-    end
-  end
+  defp highlight(t), do: IO.ANSI.yellow_background() <> t <> IO.ANSI.reset()
+
+  defp prepare_select(""), do: {"line", "?1=?1"}
+
+  defp prepare_select(_regex),
+    do: {"regexp_replace(line, ?1, '#{highlight("$0")}')", "regexp_like(line, ?1)"}
 
   defp prepare_query(%{db: db, limit: limit}, regex) do
-    with {:ok, select_stm} <-
+    with {field, filter} <- prepare_select(regex),
+         {:ok, select_stm} <-
            Sqlite3.prepare(
              db,
-             "SELECT id, line, timestamp, regexp_replace(line, ?1, '#{Streamlog.highlight("$0")}')
+             "SELECT id, line, timestamp, #{field}
               FROM logs
-              WHERE regexp_like(line, ?1)
+              WHERE #{filter}
               ORDER BY id DESC
               LIMIT ?2"
            ),
@@ -270,13 +272,28 @@ defmodule Streamlog.LogIngester do
     end
   end
 
-  defp prepare_query(_db, _regex), do: {:error, nil}
+  defp prepare_query(%{db: db}, regex, ids) do
+    with {field, filter} <- prepare_select(regex),
+         {:ok, select_stm} <-
+           Sqlite3.prepare(
+             db,
+             "SELECT id, line, timestamp, #{field}
+              FROM logs
+              WHERE #{filter} AND id in (#{ids |> Enum.map(fn _ -> "?" end) |> Enum.join(",")})
+              ORDER BY id DESC"
+           ),
+         :ok = Exqlite.Sqlite3.bind(select_stm, [regex | ids]) do
+      {:ok, select_stm}
+    end
+  end
+
+  defp prepare_query(_db, _regex, _ids), do: {:error, nil}
 
   defp create_log_entry({line, index}),
     do: %{id: index, line: line, timestamp: DateTime.now!("Etc/UTC"), line_decorated: line}
 
   defp to_record([id, line, timestamp, line_decorated]),
-    do: %{id: id, line: line, timestamp: timestamp, line_decorated: {:safe, line_decorated}}
+    do: %{id: id, line: line, timestamp: timestamp, line_decorated: line_decorated}
 
   defp notify_subscribers(line),
     do: Phoenix.PubSub.broadcast(PhoenixPlayground.PubSub, @topic, {:line, line})
