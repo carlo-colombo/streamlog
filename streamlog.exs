@@ -24,6 +24,7 @@ defmodule Streamlog.IndexLive do
   use Phoenix.LiveView
   alias Streamlog.State
   alias Streamlog.LogIngester
+  alias Phoenix.LiveView.JS
 
   def mount(_params, _session, socket) do
     if connected?(socket), do: LogIngester.run()
@@ -77,6 +78,9 @@ defmodule Streamlog.IndexLive do
 
   def render(assigns) do
     ~H"""
+    <div id="status" class="hidden" phx-disconnected={JS.show()} phx-connected={JS.hide()}>
+      Attempting to reconnect...
+    </div>
     <header>
       <.form for={@form} phx-change="filter" >
         <.input type="text" field={@form[:query]} placeholder="filter"/>
@@ -358,12 +362,10 @@ defmodule Streamlog.State do
   def set(update_fn), do: Agent.update(__MODULE__, &update_fn.(&1))
 
   def get_query_and_regex do
-    query = Agent.get(__MODULE__, &Map.get(&1, "query"))
-
-    if query == nil or query == "" do
-      {nil, nil}
-    else
+    if query = Agent.get(__MODULE__, &Map.get(&1, "query", "")) do
       {query, "(?i)#{query}"}
+    else
+      {nil, nil}
     end
   end
 end
