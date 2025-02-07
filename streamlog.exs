@@ -33,6 +33,7 @@ defmodule Streamlog.IndexLive do
     response =
       socket
       |> stream(:logs, filtered_lines())
+      |> assign(:count, 0)
       |> assign(:form, to_form(%{"query" => query}))
       |> assign(
         :page_title,
@@ -44,6 +45,10 @@ defmodule Streamlog.IndexLive do
 
   def handle_info({:line, line}, socket) do
     {:noreply, stream_insert(socket, :logs, line, at: 0)}
+  end
+
+  def handle_info({:count, count}, socket) do
+    {:noreply, assign(socket, :count, count)}
   end
 
   def handle_event("filter", %{"query" => query} = params, socket) do
@@ -72,9 +77,12 @@ defmodule Streamlog.IndexLive do
 
   def render(assigns) do
     ~H"""
-    <.form for={@form} phx-change="filter" >
-      <.input type="text" field={@form[:query]} />
-    </.form>
+    <header>
+      <.form for={@form} phx-change="filter" >
+        <.input type="text" field={@form[:query]} placeholder="filter"/>
+      </.form>
+      <a href="/download"><button>Download ({ @count } log lines)</button></a>
+    </header>
     <table>
       <thead>
         <tr>
@@ -93,6 +101,20 @@ defmodule Streamlog.IndexLive do
       :root {
         --color-accent: #118bee15;
         --ansi-yellow: yellow;
+      }
+      header {
+        display: grid;
+        justify-content: space-between;
+        padding-bottom: 5px;
+        form {
+          grid-column: 1;
+          input {
+            width: 90%;
+          }
+        }
+        a {
+          grid-column: 8;
+        }
       }
       table {
         text-align: left;
@@ -121,9 +143,9 @@ defmodule Streamlog.IndexLive do
       }
     </style>
     <script type="module">
-      import * as fancyAnsi from 'https://esm.run/fancy-ansi';
+      import { FancyAnsi } from 'https://esm.run/fancy-ansi';
 
-      const fa = new fancyAnsi.FancyAnsi();
+      const fa = new FancyAnsi();
 
       window.hooks.Decorate = {
         mounted() {
@@ -136,6 +158,15 @@ defmodule Streamlog.IndexLive do
 
     </script>
     """
+  end
+end
+
+defmodule Streamlog.DownloadController do
+  use Phoenix.Controller
+
+  def download(conn, %{}) do
+    conn
+    |> send_download({:binary, Streamlog.LogIngester.serialize()}, filename: "streamlog.db")
   end
 end
 
@@ -156,6 +187,8 @@ defmodule Streamlog.Router do
 
     live("/", Streamlog.IndexLive, :index)
     live_dashboard("/dashboard")
+
+    get("/download", Streamlog.DownloadController, :download)
   end
 end
 
@@ -206,7 +239,7 @@ defmodule Streamlog.LogIngester do
       |> Stream.run()
     end)
 
-    {:ok, %{db: db, limit: limit}}
+    {:ok, %{db: db, limit: limit, conn: conn}}
   end
 
   @impl true
@@ -224,6 +257,18 @@ defmodule Streamlog.LogIngester do
       end
 
     {:reply, records, state}
+  end
+
+  @impl true
+  def handle_call(:serialize, _from, state = %{db: db}) do
+    {:ok, binary} = Sqlite3.serialize(db)
+    {:reply, binary, state}
+  end
+
+  @impl true
+  def handle_call(:count, _from, state = %{conn: conn}) do
+    {:ok, [[count]], _} = Basic.exec(conn, "select count(*) from logs;") |> Basic.rows()
+    {:reply, count, state}
   end
 
   @impl true
@@ -247,7 +292,12 @@ defmodule Streamlog.LogIngester do
 
   def run, do: Phoenix.PubSub.subscribe(PhoenixPlayground.PubSub, @topic)
 
+  def notify_subscribers(event, data),
+    do: Phoenix.PubSub.broadcast(PhoenixPlayground.PubSub, @topic, {event, data})
+
   def list_entries(regex), do: GenServer.call(__MODULE__, {:filter, regex})
+
+  def serialize(), do: GenServer.call(__MODULE__, :serialize)
 
   defp highlight(t), do: IO.ANSI.yellow_background() <> t <> IO.ANSI.reset()
 
@@ -295,8 +345,7 @@ defmodule Streamlog.LogIngester do
   defp to_record([id, line, timestamp, line_decorated]),
     do: %{id: id, line: line, timestamp: timestamp, line_decorated: line_decorated}
 
-  defp notify_subscribers(line),
-    do: Phoenix.PubSub.broadcast(PhoenixPlayground.PubSub, @topic, {:line, line})
+  defp notify_subscribers(line), do: notify_subscribers(:line, line)
 end
 
 defmodule Streamlog.State do
@@ -317,6 +366,30 @@ defmodule Streamlog.State do
       {query, "(?i)#{query}"}
     end
   end
+end
+
+defmodule Streamlog.Refresh do
+  use GenServer
+
+  def start_link(init) do
+    GenServer.start_link(__MODULE__, init, name: __MODULE__)
+  end
+
+  def init(state) do
+    schedule()
+    {:ok, state}
+  end
+
+  def handle_info(:tick, state) do
+    schedule()
+    count = GenServer.call(Streamlog.LogIngester, :count)
+
+    Streamlog.LogIngester.notify_subscribers(:count, count)
+
+    {:noreply, state}
+  end
+
+  defp schedule, do: Process.send_after(self(), :tick, 2000)
 end
 
 {options, _, _} =
@@ -349,7 +422,8 @@ Logger.info("Streamlog starting with the following options: #{inspect(options)}"
     live_reload: false,
     child_specs: [
       {Streamlog.LogIngester, %{limit: Keyword.fetch!(options, :limit)}},
-      {Streamlog.State, %{"query" => Keyword.fetch!(options, :query)}}
+      {Streamlog.State, %{"query" => Keyword.fetch!(options, :query)}},
+      Streamlog.Refresh
     ],
     open_browser: Keyword.fetch!(options, :open),
     port: Keyword.fetch!(options, :port)
