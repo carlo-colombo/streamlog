@@ -184,7 +184,7 @@ defmodule Streamlog.Supervisor do
   alias Exqlite.Basic
 
   @create_table "CREATE TABLE IF NOT EXISTS logs (id integer primary key, line text, timestamp text);
-         CREATE INDEX logs_idx_4a224123 ON logs(timestamp DESC);
+         CREATE INDEX IF NOT EXISTS logs_idx_4a224123 ON logs(timestamp DESC);
         "
 
   def start_link(init) do
@@ -193,12 +193,15 @@ defmodule Streamlog.Supervisor do
 
   @impl true
   def init(options) do
-    {:ok, conn = %{db: db}} = Basic.open(":memory:")
+    {:ok, conn = %{db: db}} = Basic.open(Keyword.fetch!(options, :database))
 
     :ok = Basic.enable_load_extension(conn)
     {:ok, _, _, _} = Basic.load_extension(conn, ExSqleanCompiled.path_for_module("regexp"))
     :ok = Basic.disable_load_extension(conn)
 
+    if Keyword.fetch!(options, :truncate) do
+      :ok = Sqlite3.execute(db, "DROP TABLE IF EXISTS logs;")
+    end
     :ok = Sqlite3.execute(db, @create_table)
 
     query = Keyword.fetch!(options, :query)
@@ -224,7 +227,7 @@ defmodule Streamlog.Ingester do
   alias Exqlite.Sqlite3
   alias Exqlite.Basic
 
-  @insert "INSERT INTO logs (id, line, timestamp) VALUES (?1, ?2, ?3)"
+  @insert "INSERT INTO logs (line, timestamp) VALUES (?1, ?2)"
 
   def start_link(init) do
     GenServer.start_link(__MODULE__, init, name: __MODULE__)
@@ -238,10 +241,8 @@ defmodule Streamlog.Ingester do
       :stdio
       |> IO.stream(:line)
       |> Stream.filter(&(String.trim(&1) != ""))
-      |> Stream.with_index(1)
-      |> Stream.map(&create_log_entry/1)
-      |> Stream.each(fn entry ->
-        :ok = Exqlite.Sqlite3.bind(insert_stm, [entry.id, entry.line, entry.timestamp])
+      |> Stream.each(fn line ->
+        :ok = Exqlite.Sqlite3.bind(insert_stm, [line, DateTime.now!("Etc/UTC")])
         :done = Exqlite.Sqlite3.step(db, insert_stm)
       end)
       |> Stream.run()
@@ -257,9 +258,6 @@ defmodule Streamlog.Ingester do
   end
 
   def serialize(), do: GenServer.call(__MODULE__, :serialize)
-
-  defp create_log_entry({line, index}),
-    do: %{id: index, line: line, timestamp: DateTime.now!("Etc/UTC"), line_decorated: line}
 end
 
 defmodule Streamlog.Forwarder do
@@ -399,7 +397,9 @@ end
       port: :integer,
       open: :boolean,
       limit: :integer,
-      query: :string
+      query: :string,
+      database: :string,
+      truncate: :boolean
     ]
   )
 
@@ -409,7 +409,9 @@ options =
     port: 5051,
     open: false,
     limit: 5000,
-    query: ""
+    query: "",
+    database: ":memory:",
+    truncate: false
   )
 
 Application.put_env(:streamlog, :title, Keyword.fetch!(options, :title))
