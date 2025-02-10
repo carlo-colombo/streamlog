@@ -92,8 +92,7 @@ defmodule Streamlog.IndexLive do
         display: grid;
         justify-content: space-between;
         padding-bottom: 5px;
-        form {
-          grid-column: 1;
+        form { grid-column: 1;
           input {
             width: 90%;
           }
@@ -354,7 +353,7 @@ defmodule Streamlog.Forwarder do
 
   defp highlight(t), do: IO.ANSI.yellow_background() <> t <> IO.ANSI.reset()
 
-  defp prepare_select(nil), do: {"line", "?1=?1"}
+  defp prepare_select(nil), do: {"line", "(?1=?1 or 1=1)"}
 
   defp prepare_select(_regex),
     do: {"regexp_replace(line, ?1, '#{highlight("$0")}')", "regexp_like(line, ?1)"}
@@ -370,7 +369,7 @@ defmodule Streamlog.Forwarder do
               ORDER BY id DESC
               LIMIT ?2"
            ),
-         :ok = Exqlite.Sqlite3.bind(select_stm, [regex || 1, limit]) do
+         :ok = Exqlite.Sqlite3.bind(select_stm, [regex, limit]) do
       {:ok, select_stm}
     end
   end
