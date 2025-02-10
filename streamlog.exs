@@ -243,7 +243,7 @@ defmodule Streamlog.LogIngester do
       |> Stream.run()
     end)
 
-    {:ok, %{db: db, limit: limit, conn: conn}}
+    {:ok, %{db: db, limit: limit, conn: conn, query: ""}}
   end
 
   @impl true
@@ -269,14 +269,15 @@ defmodule Streamlog.LogIngester do
     {:reply, binary, state}
   end
 
-  @impl true
-  def handle_call(:count, _from, state = %{conn: conn}) do
+  defp update_count(conn) do
     {:ok, [[count]], _} = Basic.exec(conn, "select count(*) from logs;") |> Basic.rows()
-    {:reply, count, state}
+    notify_subscribers(:count, count)
   end
 
   @impl true
-  def handle_info({:insert, _, _, id}, state = %{db: db}) do
+  def handle_info({:insert, _, _, id}, state = %{db: db, conn: conn}) do
+    Task.start(fn -> update_count(conn) end)
+
     {_, regex} = State.get_query_and_regex()
 
     with {:ok, select_stm} <- prepare_query(state, regex || "", [id]),
@@ -370,30 +371,6 @@ defmodule Streamlog.State do
   end
 end
 
-defmodule Streamlog.Refresh do
-  use GenServer
-
-  def start_link(init) do
-    GenServer.start_link(__MODULE__, init, name: __MODULE__)
-  end
-
-  def init(state) do
-    schedule()
-    {:ok, state}
-  end
-
-  def handle_info(:tick, state) do
-    schedule()
-    count = GenServer.call(Streamlog.LogIngester, :count)
-
-    Streamlog.LogIngester.notify_subscribers(:count, count)
-
-    {:noreply, state}
-  end
-
-  defp schedule, do: Process.send_after(self(), :tick, 2000)
-end
-
 {options, _, _} =
   OptionParser.parse(System.argv(),
     strict: [
@@ -425,7 +402,6 @@ Logger.info("Streamlog starting with the following options: #{inspect(options)}"
     child_specs: [
       {Streamlog.LogIngester, %{limit: Keyword.fetch!(options, :limit)}},
       {Streamlog.State, %{"query" => Keyword.fetch!(options, :query)}},
-      Streamlog.Refresh
     ],
     open_browser: Keyword.fetch!(options, :open),
     port: Keyword.fetch!(options, :port)
