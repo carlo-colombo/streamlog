@@ -9,33 +9,19 @@ Mix.install([
 
 require Logger
 
-defmodule MyAnsi do
-  @ansi_regex ~r/(\x9B|\x1B\[)[0-?]*[ -\/]*[@-~]/
-  @non_alpha_regex ~r/[^0-9a-zA-Z]/
-
-  def strip_ansi(ansi_string) when is_binary(ansi_string) do
-    Regex.replace(@ansi_regex, ansi_string, "")
-    |> String.split(",")
-    |> Enum.map(&Regex.replace(@non_alpha_regex, &1, ""))
-  end
-end
-
 defmodule Streamlog.IndexLive do
   use Phoenix.LiveView
-  alias Streamlog.State
-  alias Streamlog.LogIngester
+  alias Streamlog.Forwarder
   alias Phoenix.LiveView.JS
 
   def mount(_params, _session, socket) do
-    if connected?(socket), do: LogIngester.run()
-
-    {query, _} = State.get_query_and_regex()
+    if connected?(socket), do: Forwarder.run()
 
     response =
       socket
       |> stream(:logs, filtered_lines())
-      |> assign(:count, 0)
-      |> assign(:form, to_form(%{"query" => query}))
+      |> assign(:count, Forwarder.count())
+      |> assign(:form, to_form(%{"query" => Forwarder.get_query()}))
       |> assign(
         :page_title,
         Application.get_env(:streamlog, :title)
@@ -53,7 +39,7 @@ defmodule Streamlog.IndexLive do
   end
 
   def handle_event("filter", %{"query" => query} = params, socket) do
-    State.set(&%{&1 | "query" => query})
+    Forwarder.set_query(query)
 
     {:noreply,
      socket
@@ -61,11 +47,7 @@ defmodule Streamlog.IndexLive do
      |> assign(:form, to_form(params))}
   end
 
-  defp filtered_lines() do
-    {_, compiled_regex} = State.get_query_and_regex()
-
-    LogIngester.list_entries(compiled_regex)
-  end
+  defp filtered_lines(), do: Forwarder.list_entries()
 
   attr(:field, Phoenix.HTML.FormField)
   attr(:rest, :global, include: ~w(type))
@@ -170,7 +152,7 @@ defmodule Streamlog.DownloadController do
 
   def download(conn, %{}) do
     conn
-    |> send_download({:binary, Streamlog.LogIngester.serialize()}, filename: "streamlog.db")
+    |> send_download({:binary, Streamlog.Ingester.serialize()}, filename: "streamlog.db")
   end
 end
 
@@ -196,40 +178,63 @@ defmodule Streamlog.Router do
   end
 end
 
-defmodule Streamlog.LogIngester do
-  use GenServer
+defmodule Streamlog.Supervisor do
+  use Supervisor
+  alias Streamlog.Forwarder
   alias Exqlite.Sqlite3
   alias Exqlite.Basic
-  alias Streamlog.State
 
-  @topic inspect(__MODULE__)
+  @create_table "CREATE TABLE IF NOT EXISTS logs (id integer primary key, line text, timestamp text);
+         CREATE INDEX logs_idx_4a224123 ON logs(timestamp DESC);
+        "
 
   def start_link(init) do
-    GenServer.start_link(__MODULE__, init, name: __MODULE__)
+    Supervisor.start_link(__MODULE__, init, name: __MODULE__)
   end
 
   @impl true
-  def init(%{limit: limit}) do
+  def init(options) do
     {:ok, conn = %{db: db}} = Basic.open(":memory:")
 
     :ok = Basic.enable_load_extension(conn)
     {:ok, _, _, _} = Basic.load_extension(conn, ExSqleanCompiled.path_for_module("regexp"))
     :ok = Basic.disable_load_extension(conn)
 
-    :ok =
-      db
-      |> Sqlite3.execute(
-        "CREATE TABLE IF NOT EXISTS logs (id integer primary key, line text, timestamp text);
-         CREATE INDEX logs_idx_4a224123 ON logs(timestamp DESC);
-        "
-      )
+    :ok = Sqlite3.execute(db, @create_table)
 
-    Sqlite3.set_update_hook(db, self())
+    query = Keyword.fetch!(options, :query)
 
+    children = [
+      {Streamlog.Ingester, %{db: db}},
+      {Streamlog.Forwarder,
+       %{
+         conn: conn,
+         db: db,
+         query: query,
+         regex: Forwarder.make_regex(query),
+         limit: Keyword.fetch!(options, :limit)
+       }}
+    ]
+
+    Supervisor.init(children, strategy: :one_for_one)
+  end
+end
+
+defmodule Streamlog.Ingester do
+  use GenServer
+  alias Exqlite.Sqlite3
+  alias Exqlite.Basic
+
+  @insert "INSERT INTO logs (id, line, timestamp) VALUES (?1, ?2, ?3)"
+
+  def start_link(init) do
+    GenServer.start_link(__MODULE__, init, name: __MODULE__)
+  end
+
+  @impl true
+  def init(state = %{db: db}) do
     Task.start(fn ->
-      {:ok, insert_stm} =
-        db
-        |> Sqlite3.prepare("INSERT INTO logs (id, line, timestamp) VALUES (?1, ?2, ?3)")
+      {:ok, insert_stm} = Sqlite3.prepare(db, @insert)
 
       :stdio
       |> IO.stream(:line)
@@ -243,13 +248,57 @@ defmodule Streamlog.LogIngester do
       |> Stream.run()
     end)
 
-    {:ok, %{db: db, limit: limit, conn: conn, query: ""}}
+    {:ok, state}
   end
 
   @impl true
-  def handle_call({:filter, regex}, _from, state = %{db: db}) do
+  def handle_call(:serialize, _from, state = %{db: db}) do
+    {:ok, binary} = Sqlite3.serialize(db)
+    {:reply, binary, state}
+  end
+
+  def serialize(), do: GenServer.call(__MODULE__, :serialize)
+
+  defp create_log_entry({line, index}),
+    do: %{id: index, line: line, timestamp: DateTime.now!("Etc/UTC"), line_decorated: line}
+end
+
+defmodule Streamlog.Forwarder do
+  use GenServer
+
+  alias Exqlite.Sqlite3
+  alias Exqlite.Basic
+
+  @topic inspect(__MODULE__)
+
+  def start_link(init) do
+    GenServer.start_link(__MODULE__, init, name: __MODULE__)
+  end
+
+  @impl true
+  def init(init_arg = %{db: db}) do
+    :ok = Sqlite3.set_update_hook(db, self())
+
+    {:ok, init_arg}
+  end
+
+  @impl true
+  def handle_cast({:set_query, query}, state),
+    do: {:noreply, %{state | regex: make_regex(query), query: query}}
+
+  @impl true
+  def handle_call(:get_query, _from, state = %{query: query}), do: {:reply, query, state}
+
+  @impl true
+  def handle_call(:count, _from, state = %{conn: conn}) do
+    {:ok, [[count]], _} = Basic.exec(conn, "select count(*) from logs;") |> Basic.rows()
+    {:reply, count, state}
+  end
+
+  @impl true
+  def handle_call(:list, _from, state = %{db: db, regex: regex}) do
     records =
-      with {:ok, select_stm} <- prepare_query(state, regex || ""),
+      with {:ok, select_stm} <- prepare_query(state, regex),
            {:ok, rows} <- Sqlite3.fetch_all(db, select_stm) do
         rows
         |> Stream.map(&to_record/1)
@@ -263,28 +312,28 @@ defmodule Streamlog.LogIngester do
     {:reply, records, state}
   end
 
-  @impl true
-  def handle_call(:serialize, _from, state = %{db: db}) do
-    {:ok, binary} = Sqlite3.serialize(db)
-    {:reply, binary, state}
-  end
+  def count(), do: GenServer.call(__MODULE__, :count)
+  def set_query(query), do: GenServer.cast(__MODULE__, {:set_query, query})
+  def get_query(), do: GenServer.call(__MODULE__, :get_query)
+  def list_entries(), do: GenServer.call(__MODULE__, :list)
 
-  defp update_count(conn) do
-    {:ok, [[count]], _} = Basic.exec(conn, "select count(*) from logs;") |> Basic.rows()
-    notify_subscribers(:count, count)
-  end
+  def make_regex(""), do: nil
+  def make_regex(query), do: "(?i)" <> query
 
   @impl true
-  def handle_info({:insert, _, _, id}, state = %{db: db, conn: conn}) do
-    Task.start(fn -> update_count(conn) end)
+  def handle_info({:insert, _, _, id}, state = %{db: db, regex: regex}) do
+    Task.start(fn -> notify_subscribers(:count, count()) end)
 
-    {_, regex} = State.get_query_and_regex()
-
-    with {:ok, select_stm} <- prepare_query(state, regex || "", [id]),
+    with {:ok, select_stm} <- prepare_query(state, regex, [id]),
          result <- Sqlite3.step(db, select_stm) do
       case result do
-        {:row, row} -> row |> to_record() |> notify_subscribers()
-        :done -> nil
+        {:row, row} ->
+          row
+          |> to_record()
+          |> then(&notify_subscribers(:line, &1))
+
+        :done ->
+          nil
       end
     else
       {:error, message} ->
@@ -295,18 +344,17 @@ defmodule Streamlog.LogIngester do
     {:noreply, state}
   end
 
-  def run, do: Phoenix.PubSub.subscribe(PhoenixPlayground.PubSub, @topic)
-
   def notify_subscribers(event, data),
     do: Phoenix.PubSub.broadcast(PhoenixPlayground.PubSub, @topic, {event, data})
 
-  def list_entries(regex), do: GenServer.call(__MODULE__, {:filter, regex})
+  def run, do: Phoenix.PubSub.subscribe(PhoenixPlayground.PubSub, @topic)
 
-  def serialize(), do: GenServer.call(__MODULE__, :serialize)
+  defp to_record([id, line, timestamp, line_decorated]),
+    do: %{id: id, line: line, timestamp: timestamp, line_decorated: line_decorated}
 
   defp highlight(t), do: IO.ANSI.yellow_background() <> t <> IO.ANSI.reset()
 
-  defp prepare_select(""), do: {"line", "?1=?1"}
+  defp prepare_select(nil), do: {"line", "?1=?1"}
 
   defp prepare_select(_regex),
     do: {"regexp_replace(line, ?1, '#{highlight("$0")}')", "regexp_like(line, ?1)"}
@@ -322,7 +370,7 @@ defmodule Streamlog.LogIngester do
               ORDER BY id DESC
               LIMIT ?2"
            ),
-         :ok = Exqlite.Sqlite3.bind(select_stm, [regex, limit]) do
+         :ok = Exqlite.Sqlite3.bind(select_stm, [regex || 1, limit]) do
       {:ok, select_stm}
     end
   end
@@ -343,32 +391,6 @@ defmodule Streamlog.LogIngester do
   end
 
   defp prepare_query(_db, _regex, _ids), do: {:error, nil}
-
-  defp create_log_entry({line, index}),
-    do: %{id: index, line: line, timestamp: DateTime.now!("Etc/UTC"), line_decorated: line}
-
-  defp to_record([id, line, timestamp, line_decorated]),
-    do: %{id: id, line: line, timestamp: timestamp, line_decorated: line_decorated}
-
-  defp notify_subscribers(line), do: notify_subscribers(:line, line)
-end
-
-defmodule Streamlog.State do
-  use Agent
-
-  def start_link(initial_state) do
-    Agent.start_link(fn -> initial_state end, name: __MODULE__)
-  end
-
-  def set(update_fn), do: Agent.update(__MODULE__, &update_fn.(&1))
-
-  def get_query_and_regex do
-    if query = Agent.get(__MODULE__, &Map.get(&1, "query", "")) do
-      {query, "(?i)#{query}"}
-    else
-      {nil, nil}
-    end
-  end
 end
 
 {options, _, _} =
@@ -388,7 +410,7 @@ options =
     port: 5051,
     open: false,
     limit: 5000,
-    query: nil
+    query: ""
   )
 
 Application.put_env(:streamlog, :title, Keyword.fetch!(options, :title))
@@ -400,8 +422,7 @@ Logger.info("Streamlog starting with the following options: #{inspect(options)}"
     plug: Streamlog.Router,
     live_reload: false,
     child_specs: [
-      {Streamlog.LogIngester, %{limit: Keyword.fetch!(options, :limit)}},
-      {Streamlog.State, %{"query" => Keyword.fetch!(options, :query)}},
+      {Streamlog.Supervisor, options}
     ],
     open_browser: Keyword.fetch!(options, :open),
     port: Keyword.fetch!(options, :port)
