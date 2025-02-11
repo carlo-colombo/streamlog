@@ -3,7 +3,7 @@
 Mix.install([
   {:phoenix_playground, "~> 0.1.6"},
   {:phoenix_live_dashboard, "~> 0.8"},
-  {:exqlite, "~> 0.27"},
+  {:exqlite, "~> 0.29"},
   {:ex_sqlean_compiled, github: "carlo-colombo/ex_sqlean_compiled", submodules: true}
 ])
 
@@ -11,16 +11,17 @@ require Logger
 
 defmodule Streamlog.IndexLive do
   use Phoenix.LiveView
+  alias Streamlog.Ingester
   alias Streamlog.Forwarder
   alias Phoenix.LiveView.JS
 
   def mount(_params, _session, socket) do
-    if connected?(socket), do: Forwarder.run()
+    if connected?(socket), do: Forwarder.subscribe()
 
     response =
       socket
       |> stream(:logs, filtered_lines())
-      |> assign(:count, Forwarder.count())
+      |> assign(:count, Ingester.count())
       |> assign(:form, to_form(%{"query" => Forwarder.get_query()}))
       |> assign(
         :page_title,
@@ -54,7 +55,7 @@ defmodule Streamlog.IndexLive do
 
   def input(assigns) do
     ~H"""
-    <input id={@field.id} name={@field.name} value={@field.value} {@rest} />
+    <input id={@field.id} name={@field.name} value={@field.value} {@rest} phx-debounce="100"/>
     """
   end
 
@@ -207,7 +208,7 @@ defmodule Streamlog.Supervisor do
     query = Keyword.fetch!(options, :query)
 
     children = [
-      {Streamlog.Ingester, %{db: db}},
+      {Streamlog.Ingester, %{db: db, conn: conn}},
       {Streamlog.Forwarder,
        %{
          conn: conn,
@@ -242,8 +243,8 @@ defmodule Streamlog.Ingester do
       |> IO.stream(:line)
       |> Stream.filter(&(String.trim(&1) != ""))
       |> Stream.each(fn line ->
-        :ok = Exqlite.Sqlite3.bind(insert_stm, [line, DateTime.now!("Etc/UTC")])
-        :done = Exqlite.Sqlite3.step(db, insert_stm)
+        :ok = Sqlite3.bind(insert_stm, [line, DateTime.now!("Etc/UTC")])
+        :done = Sqlite3.step(db, insert_stm)
       end)
       |> Stream.run()
     end)
@@ -257,7 +258,14 @@ defmodule Streamlog.Ingester do
     {:reply, binary, state}
   end
 
+  @impl true
+  def handle_call(:count, _from, state = %{conn: conn}) do
+    {:ok, [[count]], _} = Basic.exec(conn, "select count(*) from logs;") |> Basic.rows()
+    {:reply, count, state}
+  end
+
   def serialize(), do: GenServer.call(__MODULE__, :serialize)
+  def count(), do: GenServer.call(__MODULE__, :count)
 end
 
 defmodule Streamlog.Forwarder do
@@ -265,6 +273,7 @@ defmodule Streamlog.Forwarder do
 
   alias Exqlite.Sqlite3
   alias Exqlite.Basic
+  alias Streamlog.Ingester
 
   @topic inspect(__MODULE__)
 
@@ -287,12 +296,6 @@ defmodule Streamlog.Forwarder do
   def handle_call(:get_query, _from, state = %{query: query}), do: {:reply, query, state}
 
   @impl true
-  def handle_call(:count, _from, state = %{conn: conn}) do
-    {:ok, [[count]], _} = Basic.exec(conn, "select count(*) from logs;") |> Basic.rows()
-    {:reply, count, state}
-  end
-
-  @impl true
   def handle_call(:list, _from, state = %{db: db, regex: regex}) do
     records =
       with {:ok, select_stm} <- prepare_query(state, regex),
@@ -309,7 +312,6 @@ defmodule Streamlog.Forwarder do
     {:reply, records, state}
   end
 
-  def count(), do: GenServer.call(__MODULE__, :count)
   def set_query(query), do: GenServer.cast(__MODULE__, {:set_query, query})
   def get_query(), do: GenServer.call(__MODULE__, :get_query)
   def list_entries(), do: GenServer.call(__MODULE__, :list)
@@ -319,7 +321,7 @@ defmodule Streamlog.Forwarder do
 
   @impl true
   def handle_info({:insert, _, _, id}, state = %{db: db, regex: regex}) do
-    Task.start(fn -> notify_subscribers(:count, count()) end)
+    Task.start(fn -> notify_subscribers(:count, Ingester.count()) end)
 
     with {:ok, select_stm} <- prepare_query(state, regex, [id]),
          result <- Sqlite3.step(db, select_stm) do
@@ -344,7 +346,7 @@ defmodule Streamlog.Forwarder do
   def notify_subscribers(event, data),
     do: Phoenix.PubSub.broadcast(PhoenixPlayground.PubSub, @topic, {event, data})
 
-  def run, do: Phoenix.PubSub.subscribe(PhoenixPlayground.PubSub, @topic)
+  def subscribe, do: Phoenix.PubSub.subscribe(PhoenixPlayground.PubSub, @topic)
 
   defp to_record([id, line, timestamp, line_decorated]),
     do: %{id: id, line: line, timestamp: timestamp, line_decorated: line_decorated}
