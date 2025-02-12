@@ -184,40 +184,48 @@ defmodule Streamlog.Supervisor do
   alias Exqlite.Sqlite3
   alias Exqlite.Basic
 
-  @create_table "CREATE TABLE IF NOT EXISTS logs (id integer primary key, line text, timestamp text);
-         CREATE INDEX IF NOT EXISTS logs_idx_4a224123 ON logs(timestamp DESC);
-        "
+  @create_table "
+    CREATE TABLE IF NOT EXISTS logs (id integer primary key, line text, timestamp text);
+    CREATE INDEX IF NOT EXISTS logs_idx_4a224123 ON logs(timestamp DESC);
+  "
 
   def start_link(init) do
-    Supervisor.start_link(__MODULE__, init, name: __MODULE__)
+    Supervisor.start_link(__MODULE__, Enum.into(init, %{}), name: __MODULE__)
   end
 
   @impl true
-  def init(options) do
-    {:ok, conn = %{db: db}} = Basic.open(Keyword.fetch!(options, :database))
+  def init(%{
+        database: database,
+        query: query,
+        truncate: truncate,
+        limit: limit,
+        only_ingest: only_ingest
+      }) do
+    {:ok, conn = %{db: db}} = Basic.open(List.first(database))
 
     :ok = Basic.enable_load_extension(conn)
     {:ok, _, _, _} = Basic.load_extension(conn, ExSqleanCompiled.path_for_module("regexp"))
     :ok = Basic.disable_load_extension(conn)
 
-    if Keyword.fetch!(options, :truncate) do
+    if truncate do
       :ok = Sqlite3.execute(db, "DROP TABLE IF EXISTS logs;")
     end
-    :ok = Sqlite3.execute(db, @create_table)
 
-    query = Keyword.fetch!(options, :query)
+    :ok = Sqlite3.execute(db, @create_table)
 
     children = [
       {Streamlog.Ingester, %{db: db, conn: conn}},
-      {Streamlog.Forwarder,
-       %{
-         conn: conn,
-         db: db,
-         query: query,
-         regex: Forwarder.make_regex(query),
-         limit: Keyword.fetch!(options, :limit)
-       }}
-    ]
+      if !only_ingest do
+        {Streamlog.Forwarder,
+         %{
+           conn: conn,
+           db: db,
+           query: query,
+           regex: Forwarder.make_regex(query),
+           limit: limit
+         }}
+      end
+    ] |> Enum.filter(&(&1))
 
     Supervisor.init(children, strategy: :one_for_one)
   end
@@ -400,33 +408,49 @@ end
       open: :boolean,
       limit: :integer,
       query: :string,
-      database: :string,
-      truncate: :boolean
+      database: :keep,
+      truncate: :boolean,
+      only_ingest: :boolean
     ]
   )
 
 options =
-  Keyword.validate!(options,
+  options
+  |> Keyword.update(:database, [":memory:"], fn _ -> Keyword.get_values(options, :database) end)
+  |> Keyword.validate!(
     title: "Stream Log",
     port: 5051,
     open: false,
     limit: 5000,
     query: "",
-    database: ":memory:",
-    truncate: false
+    truncate: false,
+    database: [],
+    only_ingest: false
   )
 
 Application.put_env(:streamlog, :title, Keyword.fetch!(options, :title))
 
 Logger.info("Streamlog starting with the following options: #{inspect(options)}")
 
-{:ok, _} =
-  PhoenixPlayground.start(
-    plug: Streamlog.Router,
-    live_reload: false,
-    child_specs: [
-      {Streamlog.Supervisor, options}
-    ],
-    open_browser: Keyword.fetch!(options, :open),
-    port: Keyword.fetch!(options, :port)
-  )
+if Keyword.fetch!(options, :only_ingest) do
+  {:ok, _} =
+    Supervisor.start_link(
+      [
+        {Streamlog.Supervisor, options}
+      ],
+      strategy: :one_for_one
+    )
+
+  Process.sleep(:infinity)
+else
+  {:ok, _} =
+    PhoenixPlayground.start(
+      plug: Streamlog.Router,
+      live_reload: false,
+      child_specs: [
+        {Streamlog.Supervisor, options}
+      ],
+      open_browser: Keyword.fetch!(options, :open),
+      port: Keyword.fetch!(options, :port)
+    )
+end
