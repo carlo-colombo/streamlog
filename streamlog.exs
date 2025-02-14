@@ -109,9 +109,9 @@ defmodule Streamlog.IndexLive do
     <table>
       <thead>
         <tr>
-          <th>source</th>
-          <th>timestamp</th>
-          <th>-</th>
+          <th class="source">source</th>
+          <th class="timestamp">timestamp</th>
+          <th class="message">-</th>
         </tr>
       </thead>
       <tbody id="log-list" phx-update="stream">
@@ -168,14 +168,17 @@ defmodule Streamlog.IndexLive do
         font-family: monospace;
         display: table;
         min-width: 100%;
+        .timestamp {
+          width: 250px;
+        }
+
+        .source {
+          width: 100px;
+        }
 
         td {
           padding-right: 10px;
           border-right: solid 1px #339981;
-
-          &.timestamp {
-            min-width: 250px;
-          }
 
           &.message {
             text-align: left;
@@ -392,9 +395,9 @@ defmodule Streamlog.Forwarder do
   def handle_call(:get_query, _from, state = %{query: query}), do: {:reply, query, state}
 
   @impl true
-  def handle_call(:list, _from, state = %{db: db, regex: regex}) do
+  def handle_call(:list, _from, state = %{db: db}) do
     records =
-      with {:ok, select_stm} <- prepare_query(state, regex),
+      with {:ok, select_stm} <- prepare_query(state),
            {:ok, rows} <- Sqlite3.fetch_all(db, select_stm) do
         rows
         |> Stream.map(&to_record/1)
@@ -417,10 +420,10 @@ defmodule Streamlog.Forwarder do
   def make_regex(query), do: "(?i)" <> query
 
   @impl true
-  def handle_info({:insert, _, _, id}, state = %{db: db, regex: regex}) do
+  def handle_info({:insert, _, _, id}, state = %{db: db}) do
     Task.start(fn -> notify_subscribers(:count, Ingester.count()) end)
 
-    with {:ok, select_stm} <- prepare_query(state, regex, id),
+    with {:ok, select_stm} <- prepare_query(state, id),
          result <- Sqlite3.step(db, select_stm) do
       case result do
         {:row, row} ->
@@ -460,7 +463,7 @@ defmodule Streamlog.Forwarder do
   defp and_cond(nil, _), do: ""
   defp and_cond(_, do: query_part), do: "AND " <> query_part
 
-  defp prepare_query(%{db: db, source: source, limit: limit}, regex, id \\ nil) do
+  defp prepare_query(%{db: db, source: source, limit: limit, regex: regex},  id \\ nil) do
     {:ok, select_stm} =
       Sqlite3.prepare(
         db,
