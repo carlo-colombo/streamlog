@@ -22,11 +22,14 @@ defmodule Streamlog.IndexLive do
       socket
       |> stream(:logs, filtered_lines())
       |> assign(:count, Ingester.count())
+      |> assign(:sources, sources())
       |> assign(:form, to_form(%{"query" => Forwarder.get_query()}))
       |> assign(
         :page_title,
         Application.get_env(:streamlog, :title)
       )
+
+    :net_kernel.monitor_nodes(true)
 
     {:ok, response}
   end
@@ -39,6 +42,14 @@ defmodule Streamlog.IndexLive do
     {:noreply, assign(socket, :count, count)}
   end
 
+  def handle_info({:nodeup, _node}, socket) do
+    {:noreply, assign(socket, :sources, sources())}
+  end
+
+  def handle_info({:nodedown, _node}, socket) do
+    {:noreply, assign(socket, :sources, sources())}
+  end
+
   def handle_event("filter", %{"query" => query} = params, socket) do
     Forwarder.set_query(query)
 
@@ -49,6 +60,11 @@ defmodule Streamlog.IndexLive do
   end
 
   defp filtered_lines(), do: Forwarder.list_entries()
+
+  defp sources(),
+    do:
+      [Node.self() | Node.list()]
+      |> Enum.map(fn n -> n |> Atom.to_string() |> String.split("@") |> List.first() end)
 
   attr(:field, Phoenix.HTML.FormField)
   attr(:rest, :global, include: ~w(type))
@@ -65,10 +81,13 @@ defmodule Streamlog.IndexLive do
       Attempting to reconnect...
     </div>
     <header>
-      <.form for={@form} phx-change="filter" >
-        <.input type="text" field={@form[:query]} placeholder="filter"/>
-      </.form>
-      <a href="/download"><button>Download ({ @count } log lines)</button></a>
+        <.form for={@form} phx-change="filter" >
+          <.input type="text" field={@form[:query]} placeholder="filter"/>
+        </.form>
+        <a href="/download"><button>Download ({ @count } log lines)</button></a>
+        <div class="sources">
+          Connected sources ({Enum.count(@sources)}): <span :for={ s <- @sources} class="source"><%= s %></span>
+        </div>
     </header>
     <table>
       <thead>
@@ -91,17 +110,37 @@ defmodule Streamlog.IndexLive do
         --color-accent: #118bee15;
         --ansi-yellow: yellow;
       }
+      body {
+        font-family: sans-serif;
+      }
       header {
         display: grid;
         justify-content: space-between;
         padding-bottom: 5px;
-        form { grid-column: 1;
+        row-gap: 5px;
+        form {
+          grid-column: 1/4;
           input {
             width: 90%;
           }
         }
         a {
           grid-column: 8;
+        }
+
+        .sources {
+          grid-column: 1/8;
+          grid-row: 2;
+
+          .source {
+            font-family: monospace;
+            &:after {
+              content: ', '
+            }
+            &:last-child:after {
+              content: ''
+            }
+          }
         }
       }
       table {
