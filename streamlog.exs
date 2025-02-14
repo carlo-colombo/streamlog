@@ -73,12 +73,14 @@ defmodule Streamlog.IndexLive do
     <table>
       <thead>
         <tr>
+          <th>source</th>
           <th>timestamp</th>
           <th>-</th>
         </tr>
       </thead>
       <tbody id="log-list" phx-update="stream">
         <tr :for={{id, log} <- @streams.logs} id={id} class={if rem(log.id,2)==0, do: "even", else: "odd"}  phx-hook="Decorate">
+          <td class="source"><%= log.source %></td>
           <td class="timestamp"><%= log.timestamp %></td>
           <td class="message"><%= log.line_decorated %></td>
         </tr>
@@ -185,12 +187,12 @@ defmodule Streamlog.Supervisor do
   alias Exqlite.Basic
 
   @create_table "
-    CREATE TABLE IF NOT EXISTS logs (id integer primary key, line text, timestamp text);
+    CREATE TABLE IF NOT EXISTS logs (id integer primary key, line text, timestamp text, source text);
     CREATE INDEX IF NOT EXISTS logs_idx_4a224123 ON logs(timestamp DESC);
   "
 
   def start_link(init) do
-    Supervisor.start_link(__MODULE__, Enum.into(init, %{}), name: __MODULE__)
+    Supervisor.start_link(__MODULE__, init, name: __MODULE__)
   end
 
   @impl true
@@ -199,9 +201,9 @@ defmodule Streamlog.Supervisor do
         query: query,
         truncate: truncate,
         limit: limit,
-        only_ingest: only_ingest
+        source: source
       }) do
-    {:ok, conn = %{db: db}} = Basic.open(List.first(database))
+    {:ok, conn = %{db: db}} = Basic.open(database)
 
     :ok = Basic.enable_load_extension(conn)
     {:ok, _, _, _} = Basic.load_extension(conn, ExSqleanCompiled.path_for_module("regexp"))
@@ -214,18 +216,16 @@ defmodule Streamlog.Supervisor do
     :ok = Sqlite3.execute(db, @create_table)
 
     children = [
-      {Streamlog.Ingester, %{db: db, conn: conn}},
-      if !only_ingest do
-        {Streamlog.Forwarder,
-         %{
-           conn: conn,
-           db: db,
-           query: query,
-           regex: Forwarder.make_regex(query),
-           limit: limit
-         }}
-      end
-    ] |> Enum.filter(&(&1))
+      {Streamlog.Ingester, %{db: db, conn: conn, source: source}},
+      {Streamlog.Forwarder,
+       %{
+         conn: conn,
+         db: db,
+         query: query,
+         regex: Forwarder.make_regex(query),
+         limit: limit
+       }}
+    ]
 
     Supervisor.init(children, strategy: :one_for_one)
   end
@@ -233,31 +233,43 @@ end
 
 defmodule Streamlog.Ingester do
   use GenServer
+  alias Streamlog.Ingester
   alias Exqlite.Sqlite3
   alias Exqlite.Basic
 
-  @insert "INSERT INTO logs (line, timestamp) VALUES (?1, ?2)"
+  @insert "INSERT INTO logs (line, timestamp, source) VALUES (?1, ?2, ?3)"
 
   def start_link(init) do
     GenServer.start_link(__MODULE__, init, name: __MODULE__)
   end
 
   @impl true
-  def init(state = %{db: db}) do
-    Task.start(fn ->
-      {:ok, insert_stm} = Sqlite3.prepare(db, @insert)
+  def init(state = %{forward_to: forward_to, source: source}) do
+    collector = String.to_atom(forward_to)
 
+    true = Node.connect(collector)
+
+    consume_stdio(&Node.spawn(collector, Ingester, :insert, [&1, source]))
+    |> Task.start()
+
+    {:ok, state}
+  end
+
+  def init(state = %{db: db, source: source}) do
+    consume_stdio(&_insert(db, &1, source))
+    |> Task.start()
+
+    {:ok, state}
+  end
+
+  defp consume_stdio(handle_line) do
+    fn ->
       :stdio
       |> IO.stream(:line)
       |> Stream.filter(&(String.trim(&1) != ""))
-      |> Stream.each(fn line ->
-        :ok = Sqlite3.bind(insert_stm, [line, DateTime.now!("Etc/UTC")])
-        :done = Sqlite3.step(db, insert_stm)
-      end)
+      |> Stream.each(handle_line)
       |> Stream.run()
-    end)
-
-    {:ok, state}
+    end
   end
 
   @impl true
@@ -272,8 +284,20 @@ defmodule Streamlog.Ingester do
     {:reply, count, state}
   end
 
+  @impl true
+  def handle_call({:insert, line, source}, _from, state = %{db: db}) do
+    {:reply, _insert(db, line, source), state}
+  end
+
+  defp _insert(db, line, source) do
+    {:ok, insert_stm} = Sqlite3.prepare(db, @insert)
+    :ok = Sqlite3.bind(insert_stm, [line, DateTime.now!("Etc/UTC"), source])
+    :done = Sqlite3.step(db, insert_stm)
+  end
+
   def serialize(), do: GenServer.call(__MODULE__, :serialize)
   def count(), do: GenServer.call(__MODULE__, :count)
+  def insert(line, source), do: GenServer.call(__MODULE__, {:insert, line, source})
 end
 
 defmodule Streamlog.Forwarder do
@@ -356,8 +380,14 @@ defmodule Streamlog.Forwarder do
 
   def subscribe, do: Phoenix.PubSub.subscribe(PhoenixPlayground.PubSub, @topic)
 
-  defp to_record([id, line, timestamp, line_decorated]),
-    do: %{id: id, line: line, timestamp: timestamp, line_decorated: line_decorated}
+  defp to_record([id, line, timestamp, line_decorated, source]),
+    do: %{
+      id: id,
+      line: line,
+      timestamp: timestamp,
+      line_decorated: line_decorated,
+      source: source
+    }
 
   defp highlight(t), do: IO.ANSI.yellow_background() <> t <> IO.ANSI.reset()
 
@@ -371,7 +401,7 @@ defmodule Streamlog.Forwarder do
          {:ok, select_stm} <-
            Sqlite3.prepare(
              db,
-             "SELECT id, line, timestamp, #{field}
+             "SELECT id, line, timestamp, #{field}, source
               FROM logs
               WHERE #{filter}
               ORDER BY id DESC
@@ -387,7 +417,7 @@ defmodule Streamlog.Forwarder do
          {:ok, select_stm} <-
            Sqlite3.prepare(
              db,
-             "SELECT id, line, timestamp, #{field}
+             "SELECT id, line, timestamp, #{field}, source
               FROM logs
               WHERE #{filter} AND id in (#{ids |> Enum.map(fn _ -> "?" end) |> Enum.join(",")})
               ORDER BY id DESC"
@@ -408,15 +438,15 @@ end
       open: :boolean,
       limit: :integer,
       query: :string,
-      database: :keep,
+      database: :string,
       truncate: :boolean,
-      only_ingest: :boolean
+      name: :string,
+      forward_to: :string
     ]
   )
 
 options =
   options
-  |> Keyword.update(:database, [":memory:"], fn _ -> Keyword.get_values(options, :database) end)
   |> Keyword.validate!(
     title: "Stream Log",
     port: 5051,
@@ -424,19 +454,34 @@ options =
     limit: 5000,
     query: "",
     truncate: false,
-    database: [],
-    only_ingest: false
+    database: ":memory:",
+    name: "streamlog@localhost",
+    forward_to: nil
   )
+  |> Enum.into(%{})
 
-Application.put_env(:streamlog, :title, Keyword.fetch!(options, :title))
+Application.put_env(:streamlog, :title, options.title)
 
 Logger.info("Streamlog starting with the following options: #{inspect(options)}")
+Logger.info("Connect to this node using '#{options.name}'")
 
-if Keyword.fetch!(options, :only_ingest) do
+{:ok, _} =
+  options.name
+  |> String.to_atom()
+  |> Node.start(:shortnames)
+
+[source, _] =
+  Node.self()
+  |> Atom.to_string()
+  |> String.split("@")
+
+options = Map.merge(options, %{source: source})
+
+if options.forward_to do
   {:ok, _} =
     Supervisor.start_link(
       [
-        {Streamlog.Supervisor, options}
+        {Streamlog.Ingester, options}
       ],
       strategy: :one_for_one
     )
@@ -450,7 +495,7 @@ else
       child_specs: [
         {Streamlog.Supervisor, options}
       ],
-      open_browser: Keyword.fetch!(options, :open),
-      port: Keyword.fetch!(options, :port)
+      open_browser: options.open,
+      port: options.port
     )
 end
