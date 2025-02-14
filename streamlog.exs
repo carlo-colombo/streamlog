@@ -23,6 +23,7 @@ defmodule Streamlog.IndexLive do
       |> stream(:logs, filtered_lines())
       |> assign(:count, Ingester.count())
       |> assign(:sources, sources())
+      |> assign(:selected_source, nil)
       |> assign(:form, to_form(%{"query" => Forwarder.get_query()}))
       |> assign(
         :page_title,
@@ -59,6 +60,21 @@ defmodule Streamlog.IndexLive do
      |> assign(:form, to_form(params))}
   end
 
+  def handle_event(
+        "set source",
+        %{"source" => source},
+        %{assigns: %{selected_source: selected_source}} = socket
+      ) do
+    new_source = if source == selected_source, do: nil, else: source
+
+    Forwarder.set_source(new_source)
+
+    {:noreply,
+     socket
+     |> stream(:logs, filtered_lines(), reset: true)
+     |> assign(:selected_source, new_source)}
+  end
+
   defp filtered_lines(), do: Forwarder.list_entries()
 
   defp sources(),
@@ -86,7 +102,8 @@ defmodule Streamlog.IndexLive do
         </.form>
         <a href="/download"><button>Download ({ @count } log lines)</button></a>
         <div class="sources">
-          Connected sources ({Enum.count(@sources)}): <span :for={ s <- @sources} class="source"><%= s %></span>
+          Connected sources ({Enum.count(@sources)}):
+            <span :for={ s <- @sources} phx-click="set source" phx-value-source={s} class={"source #{if s == @selected_source, do: "selected"}"}><%= s %></span>
         </div>
     </header>
     <table>
@@ -139,6 +156,9 @@ defmodule Streamlog.IndexLive do
             }
             &:last-child:after {
               content: ''
+            }
+            &.selected {
+              font-weight: bold;
             }
           }
         }
@@ -262,7 +282,8 @@ defmodule Streamlog.Supervisor do
          db: db,
          query: query,
          regex: Forwarder.make_regex(query),
-         limit: limit
+         limit: limit,
+         source: nil
        }}
     ]
 
@@ -364,6 +385,10 @@ defmodule Streamlog.Forwarder do
     do: {:noreply, %{state | regex: make_regex(query), query: query}}
 
   @impl true
+  def handle_cast({:set_source, source}, state),
+    do: {:noreply, %{state | source: source}}
+
+  @impl true
   def handle_call(:get_query, _from, state = %{query: query}), do: {:reply, query, state}
 
   @impl true
@@ -383,6 +408,7 @@ defmodule Streamlog.Forwarder do
     {:reply, records, state}
   end
 
+  def set_source(source), do: GenServer.cast(__MODULE__, {:set_source, source})
   def set_query(query), do: GenServer.cast(__MODULE__, {:set_query, query})
   def get_query(), do: GenServer.call(__MODULE__, :get_query)
   def list_entries(), do: GenServer.call(__MODULE__, :list)
@@ -394,7 +420,7 @@ defmodule Streamlog.Forwarder do
   def handle_info({:insert, _, _, id}, state = %{db: db, regex: regex}) do
     Task.start(fn -> notify_subscribers(:count, Ingester.count()) end)
 
-    with {:ok, select_stm} <- prepare_query(state, regex, [id]),
+    with {:ok, select_stm} <- prepare_query(state, regex, id),
          result <- Sqlite3.step(db, select_stm) do
       case result do
         {:row, row} ->
@@ -430,43 +456,32 @@ defmodule Streamlog.Forwarder do
 
   defp highlight(t), do: IO.ANSI.yellow_background() <> t <> IO.ANSI.reset()
 
-  defp prepare_select(nil), do: {"line", "(?1=?1 or 1=1)"}
+  defp and_cond(false, _), do: ""
+  defp and_cond(nil, _), do: ""
+  defp and_cond(_, do: query_part), do: "AND " <> query_part
 
-  defp prepare_select(_regex),
-    do: {"regexp_replace(line, ?1, '#{highlight("$0")}')", "regexp_like(line, ?1)"}
+  defp prepare_query(%{db: db, source: source, limit: limit}, regex, id \\ nil) do
+    {:ok, select_stm} =
+      Sqlite3.prepare(
+        db,
+        "SELECT
+          id,
+          line,
+          timestamp,
+          #{if regex, do: "regexp_replace(line, '#{regex}', '#{highlight("$0")}')", else: "line"} as line,
+          source
+        FROM logs
+        WHERE 1=1
+          #{and_cond(regex, do: "regexp_like(line, '#{regex}')")}
+          #{and_cond(source, do: "source = '#{source}'")}
+          #{and_cond(id, do: "id = #{id}")}
+        ORDER BY id DESC
+        LIMIT #{limit}"
+      )
 
-  defp prepare_query(%{db: db, limit: limit}, regex) do
-    with {field, filter} <- prepare_select(regex),
-         {:ok, select_stm} <-
-           Sqlite3.prepare(
-             db,
-             "SELECT id, line, timestamp, #{field}, source
-              FROM logs
-              WHERE #{filter}
-              ORDER BY id DESC
-              LIMIT ?2"
-           ),
-         :ok = Exqlite.Sqlite3.bind(select_stm, [regex, limit]) do
-      {:ok, select_stm}
-    end
+    :ok = Exqlite.Sqlite3.bind(select_stm, [])
+    {:ok, select_stm}
   end
-
-  defp prepare_query(%{db: db}, regex, ids) do
-    with {field, filter} <- prepare_select(regex),
-         {:ok, select_stm} <-
-           Sqlite3.prepare(
-             db,
-             "SELECT id, line, timestamp, #{field}, source
-              FROM logs
-              WHERE #{filter} AND id in (#{ids |> Enum.map(fn _ -> "?" end) |> Enum.join(",")})
-              ORDER BY id DESC"
-           ),
-         :ok = Exqlite.Sqlite3.bind(select_stm, [regex | ids]) do
-      {:ok, select_stm}
-    end
-  end
-
-  defp prepare_query(_db, _regex, _ids), do: {:error, nil}
 end
 
 {options, _, _} =
