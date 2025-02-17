@@ -51,7 +51,7 @@ defmodule Streamlog.IndexLive do
     {:noreply, assign(socket, :sources, sources())}
   end
 
-  def handle_event("filter", %{"query" => query} = params, socket) do
+  def handle_event("filter", params = %{"query" => query}, socket) do
     Forwarder.set_query(query)
 
     {:noreply,
@@ -63,7 +63,7 @@ defmodule Streamlog.IndexLive do
   def handle_event(
         "set source",
         %{"source" => source},
-        %{assigns: %{selected_source: selected_source}} = socket
+        socket = %{assigns: %{selected_source: selected_source}}
       ) do
     new_source = if source == selected_source, do: nil, else: source
 
@@ -75,9 +75,9 @@ defmodule Streamlog.IndexLive do
      |> assign(:selected_source, new_source)}
   end
 
-  defp filtered_lines(), do: Forwarder.list_entries()
+  defp filtered_lines, do: Forwarder.list_entries()
 
-  defp sources(),
+  defp sources,
     do:
       [Node.self() | Node.list()]
       |> Enum.map(fn n -> n |> Atom.to_string() |> String.split("@") |> List.first() end)
@@ -308,11 +308,13 @@ defmodule Streamlog.Ingester do
 
   @impl true
   def init(state = %{forward_to: forward_to, source: source}) do
-    collector = String.to_atom(forward_to)
+    remote = String.to_atom(forward_to)
 
-    true = Node.connect(collector)
+    true = Node.connect(remote)
 
-    consume_stdio(&Node.spawn(collector, Ingester, :insert, [&1, source]))
+    supervisor = {Streamlog.TaskSupervisor, remote}
+
+    consume_stdio(&Task.Supervisor.async(supervisor, Ingester, :insert, [&1, source]))
     |> Task.start()
 
     {:ok, state}
@@ -358,8 +360,8 @@ defmodule Streamlog.Ingester do
     :done = Sqlite3.step(db, insert_stm)
   end
 
-  def serialize(), do: GenServer.call(__MODULE__, :serialize)
-  def count(), do: GenServer.call(__MODULE__, :count)
+  def serialize, do: GenServer.call(__MODULE__, :serialize)
+  def count, do: GenServer.call(__MODULE__, :count)
   def insert(line, source), do: GenServer.call(__MODULE__, {:insert, line, source})
 end
 
@@ -404,7 +406,7 @@ defmodule Streamlog.Forwarder do
         |> Enum.to_list()
       else
         {:error, message} ->
-          IO.inspect(message)
+          Logger.error(inspect(message))
           []
       end
 
@@ -413,8 +415,8 @@ defmodule Streamlog.Forwarder do
 
   def set_source(source), do: GenServer.cast(__MODULE__, {:set_source, source})
   def set_query(query), do: GenServer.cast(__MODULE__, {:set_query, query})
-  def get_query(), do: GenServer.call(__MODULE__, :get_query)
-  def list_entries(), do: GenServer.call(__MODULE__, :list)
+  def get_query, do: GenServer.call(__MODULE__, :get_query)
+  def list_entries, do: GenServer.call(__MODULE__, :list)
 
   def make_regex(""), do: nil
   def make_regex(query), do: "(?i)" <> query
@@ -550,7 +552,8 @@ else
       plug: Streamlog.Router,
       live_reload: false,
       child_specs: [
-        {Streamlog.Supervisor, options}
+        {Streamlog.Supervisor, options},
+        {Task.Supervisor, name: Streamlog.TaskSupervisor}
       ],
       open_browser: options.open,
       port: options.port
