@@ -56,7 +56,10 @@ defmodule Streamlog.IndexLive do
 
     {:noreply,
      socket
-     |> stream(:logs, filtered_lines(), reset: true, limit: Application.get_env(:streamlog, :limit))
+     |> stream(:logs, filtered_lines(),
+       reset: true,
+       limit: Application.get_env(:streamlog, :limit)
+     )
      |> assign(:form, to_form(params))}
   end
 
@@ -71,21 +74,41 @@ defmodule Streamlog.IndexLive do
 
     {:noreply,
      socket
-     |> stream(:logs, filtered_lines(), reset: true, limit: Application.get_env(:streamlog, :limit))
+     |> stream(:logs, filtered_lines(),
+       reset: true,
+       limit: Application.get_env(:streamlog, :limit)
+     )
      |> assign(:selected_source, new_source)}
   end
 
   defp filtered_lines, do: Forwarder.list_entries()
 
-  defp sources,
+  defp sources do
+    Ingester.sources()
+    |> Enum.map(
+      &Map.put(
+        &1,
+        :connection,
+        cond do
+          &1.name == Node.self() |> to_name -> :self
+          Enum.member?(names(), &1.name) -> :yes
+          true -> :no
+        end
+      )
+    )
+    |> Enum.sort_by(
+      &{Enum.find_index([:self, :yes, :no], fn e -> e == &1.connection end), &1.name}
+    )
+  end
+
+  defp to_name(node),
     do:
-      [Node.self() | Node.list()]
-      |> Enum.map(fn n ->
-        n
-        |> Atom.to_string()
-        |> String.split("@")
-        |> List.first()
-      end)
+      node
+      |> Atom.to_string()
+      |> String.split("@")
+      |> List.first()
+
+  defp names, do: Node.list() |> Enum.map(&to_name/1)
 
   attr(:field, Phoenix.HTML.FormField)
   attr(:rest, :global, include: ~w(type))
@@ -93,6 +116,25 @@ defmodule Streamlog.IndexLive do
   def input(assigns) do
     ~H"""
     <input id={@field.id} name={@field.name} value={@field.value} {@rest} phx-debounce="100"/>
+    """
+  end
+
+  defp icon(:self), do: "🏠"
+  defp icon(:yes), do: "🌍"
+  defp icon(:no), do: "❌"
+
+  defp label(:self), do: "Local node"
+  defp label(:yes), do: "Connected node"
+  defp label(:no), do: "Disconnected node"
+
+  def source(assigns) do
+    ~H"""
+      <span
+          phx-click="set source"
+          phx-value-source={@name}
+          title={label(@connection)}
+          class={"source #{if @selected, do: "selected"}"}
+          >{icon(@connection)} {@name} ({@count})</span>
     """
   end
 
@@ -107,8 +149,10 @@ defmodule Streamlog.IndexLive do
         </.form>
         <a href="/download"><button>Download ({ @count } log lines)</button></a>
         <div class="sources">
-          Connected sources ({Enum.count(@sources)}):
-            <span :for={ s <- @sources} phx-click="set source" phx-value-source={s} class={"source #{if s == @selected_source, do: "selected"}"}><%= s %></span>
+          Sources ({Enum.count(@sources)}):
+          <%= for s <- @sources do %>
+            <.source {s} selected={s.name == @selected_source}/>
+          <% end %>
         </div>
     </header>
     <table>
@@ -156,14 +200,17 @@ defmodule Streamlog.IndexLive do
 
           .source {
             font-family: monospace;
+            cursor: grab;
+            margin-right: 3px;
             &:after {
-              content: ', '
+              content: ','
             }
             &:last-child:after {
               content: ''
             }
             &.selected {
               font-weight: bold;
+              background-color: lightblue;
             }
           }
         }
@@ -256,6 +303,8 @@ defmodule Streamlog.Supervisor do
   @create_table "
     CREATE TABLE IF NOT EXISTS logs (id integer primary key, line text, timestamp text, source text);
     CREATE INDEX IF NOT EXISTS logs_idx_4a224123 ON logs(timestamp DESC);
+    CREATE INDEX IF NOT EXISTS logs_idx_00742fd9 ON logs(source);
+    CREATE INDEX IF NOT EXISTS logs_idx_39709ad1 ON logs(source, id DESC);
   "
 
   def start_link(init) do
@@ -359,6 +408,13 @@ defmodule Streamlog.Ingester do
     {:reply, _insert(db, line, source), state}
   end
 
+  def handle_call(:sources, _from, state = %{conn: conn}) do
+    {:ok, sources, _} =
+      Basic.exec(conn, "select source, count(*) from logs group by source;") |> Basic.rows()
+
+    {:reply, sources |> Enum.map(fn [name, count] -> %{name: name, count: count} end), state}
+  end
+
   defp _insert(db, line, source) do
     {:ok, insert_stm} = Sqlite3.prepare(db, @insert)
     :ok = Sqlite3.bind(insert_stm, [line, DateTime.now!("Etc/UTC"), source])
@@ -368,6 +424,7 @@ defmodule Streamlog.Ingester do
   def serialize, do: GenServer.call(__MODULE__, :serialize)
   def count, do: GenServer.call(__MODULE__, :count)
   def insert(line, source), do: GenServer.call(__MODULE__, {:insert, line, source})
+  def sources, do: GenServer.call(__MODULE__, :sources)
 end
 
 defmodule Streamlog.Forwarder do
@@ -470,7 +527,7 @@ defmodule Streamlog.Forwarder do
   defp and_cond(nil, _), do: ""
   defp and_cond(_, do: query_part), do: "AND " <> query_part
 
-  defp prepare_query(%{db: db, source: source, limit: limit, regex: regex},  id \\ nil) do
+  defp prepare_query(%{db: db, source: source, limit: limit, regex: regex}, id \\ nil) do
     {:ok, select_stm} =
       Sqlite3.prepare(
         db,
