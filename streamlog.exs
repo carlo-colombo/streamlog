@@ -56,7 +56,7 @@ defmodule Streamlog.IndexLive do
 
     {:noreply,
      socket
-     |> stream(:logs, filtered_lines(), reset: true)
+     |> stream(:logs, filtered_lines(), reset: true, limit: Application.get_env(:streamlog, :limit))
      |> assign(:form, to_form(params))}
   end
 
@@ -71,7 +71,7 @@ defmodule Streamlog.IndexLive do
 
     {:noreply,
      socket
-     |> stream(:logs, filtered_lines(), reset: true)
+     |> stream(:logs, filtered_lines(), reset: true, limit: Application.get_env(:streamlog, :limit))
      |> assign(:selected_source, new_source)}
   end
 
@@ -80,7 +80,12 @@ defmodule Streamlog.IndexLive do
   defp sources,
     do:
       [Node.self() | Node.list()]
-      |> Enum.map(fn n -> n |> Atom.to_string() |> String.split("@") |> List.first() end)
+      |> Enum.map(fn n ->
+        n
+        |> Atom.to_string()
+        |> String.split("@")
+        |> List.first()
+      end)
 
   attr(:field, Phoenix.HTML.FormField)
   attr(:rest, :global, include: ~w(type))
@@ -510,7 +515,7 @@ options =
     title: "Stream Log",
     port: 5051,
     open: false,
-    limit: 5000,
+    limit: 500,
     query: "",
     truncate: false,
     database: ":memory:",
@@ -520,6 +525,7 @@ options =
   |> Enum.into(%{})
 
 Application.put_env(:streamlog, :title, options.title)
+Application.put_env(:streamlog, :limit, options.limit)
 
 Logger.info("Streamlog starting with the following options: #{inspect(options)}")
 Logger.info("Connect to this node using '#{options.name}'")
