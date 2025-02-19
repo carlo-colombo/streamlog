@@ -16,11 +16,14 @@ defmodule Streamlog.IndexLive do
   alias Phoenix.LiveView.JS
 
   def mount(_params, _session, socket) do
-    if connected?(socket), do: Forwarder.subscribe()
+    if connected?(socket) do
+      Forwarder.subscribe()
+      Process.send(self(), :refresh, [])
+    end
 
     response =
       socket
-      |> stream(:logs, filtered_lines())
+      |> stream_logs()
       |> assign(:count, Ingester.count())
       |> assign(:sources, sources())
       |> assign(:selected_source, nil)
@@ -36,30 +39,30 @@ defmodule Streamlog.IndexLive do
   end
 
   def handle_info({:line, line}, socket) do
-    {:noreply, stream_insert(socket, :logs, line, at: 0)}
+    {:noreply,
+     stream_insert(socket, :logs, line, at: 0, limit: Application.get_env(:streamlog, :limit))}
   end
 
   def handle_info({:count, count}, socket) do
     {:noreply, assign(socket, :count, count)}
   end
 
-  def handle_info({:nodeup, _node}, socket) do
-    {:noreply, assign(socket, :sources, sources())}
+  def handle_info({:nodeup, _node}, socket), do: refresh_sources(socket)
+  def handle_info({:nodedown, _node}, socket), do: refresh_sources(socket)
+
+  def handle_info(:refresh, socket) do
+    Process.send_after(self(), :refresh, 1000)
+    refresh_sources(socket)
   end
 
-  def handle_info({:nodedown, _node}, socket) do
-    {:noreply, assign(socket, :sources, sources())}
-  end
+  defp refresh_sources(socket), do: {:noreply, assign(socket, :sources, sources())}
 
   def handle_event("filter", params = %{"query" => query}, socket) do
     Forwarder.set_query(query)
 
     {:noreply,
      socket
-     |> stream(:logs, filtered_lines(),
-       reset: true,
-       limit: Application.get_env(:streamlog, :limit)
-     )
+     |> stream_logs()
      |> assign(:form, to_form(params))}
   end
 
@@ -74,14 +77,16 @@ defmodule Streamlog.IndexLive do
 
     {:noreply,
      socket
-     |> stream(:logs, filtered_lines(),
-       reset: true,
-       limit: Application.get_env(:streamlog, :limit)
-     )
+     |> stream_logs()
      |> assign(:selected_source, new_source)}
   end
 
-  defp filtered_lines, do: Forwarder.list_entries()
+  defp stream_logs(socket) do
+    stream(socket, :logs, Forwarder.list_entries(),
+      reset: true,
+      limit: Application.get_env(:streamlog, :limit)
+    )
+  end
 
   defp sources do
     Ingester.sources()
@@ -435,6 +440,7 @@ defmodule Streamlog.Forwarder do
   alias Streamlog.Ingester
 
   @topic inspect(__MODULE__)
+  @highlight IO.ANSI.yellow_background() <> "$0" <> IO.ANSI.reset()
 
   def start_link(init) do
     GenServer.start_link(__MODULE__, init, name: __MODULE__)
@@ -521,32 +527,44 @@ defmodule Streamlog.Forwarder do
       source: source
     }
 
-  defp highlight(t), do: IO.ANSI.yellow_background() <> t <> IO.ANSI.reset()
-
-  defp and_cond(false, _), do: ""
-  defp and_cond(nil, _), do: ""
-  defp and_cond(_, do: query_part), do: "AND " <> query_part
-
   defp prepare_query(%{db: db, source: source, limit: limit, regex: regex}, id \\ nil) do
-    {:ok, select_stm} =
-      Sqlite3.prepare(
-        db,
-        "SELECT
-          id,
-          line,
-          timestamp,
-          #{if regex, do: "regexp_replace(line, '#{regex}', '#{highlight("$0")}')", else: "line"} as line,
-          source
-        FROM logs
-        WHERE 1=1
-          #{and_cond(regex, do: "regexp_like(line, '#{regex}')")}
-          #{and_cond(source, do: "source = '#{source}'")}
-          #{and_cond(id, do: "id = #{id}")}
-        ORDER BY id DESC
-        LIMIT #{limit}"
-      )
+    query = """
+    SELECT
+      id,
+      line,
+      timestamp,
+      #{if regex, do: "regexp_replace(line, ?, ?)", else: "line"} as line,
+      source
+    FROM logs
+    WHERE 1=1
+    """
 
-    :ok = Exqlite.Sqlite3.bind(select_stm, [])
+    params = []
+
+    {query, params} =
+      if regex do
+        query = query <> " AND regexp_like(line, ?)"
+        params = params ++ [regex, @highlight, regex]
+        {query, params}
+      else
+        {query, params}
+      end
+
+    {query, params} =
+      if source,
+        do: {query <> " AND source = ?", params ++ [source]},
+        else: {query, params}
+
+    {query, params} =
+      if id,
+        do: {query <> " AND id = ?", params ++ [id]},
+        else: {query, params}
+
+    query = query <> " ORDER BY id DESC LIMIT ?"
+    params = params ++ [limit]
+
+    {:ok, select_stm} = Sqlite3.prepare(db, query)
+    :ok = Sqlite3.bind(select_stm, params)
     {:ok, select_stm}
   end
 end
